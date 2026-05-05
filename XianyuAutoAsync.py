@@ -6759,6 +6759,9 @@ class XianyuLive:
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
                     headless=not show_browser,
+                    initial_cookies=self.cookies_str,
+                    proxy=self.proxy_config,
+                    use_account_persistent_profile=True,
                 )
                 # 给当前滑块实例打上 token_refresh 场景标，让滑块层在硬拒绝时尽早交还给外层走账密恢复
                 slider_stealth.risk_trigger_scene = 'token_refresh'
