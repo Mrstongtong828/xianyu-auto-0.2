@@ -2889,21 +2889,6 @@ def _extract_history_message_text(message: Dict[str, Any]) -> str:
     return raw_text[:120] if raw_text else ''
 
 
-def _messages_need_remote_hydration(messages: List[Dict[str, Any]]) -> bool:
-    """本地消息为空或几乎都不可展示时，触发远端补拉。"""
-    if not messages:
-        return True
-
-    renderable_count = 0
-    for message in messages:
-        content = str((message or {}).get('content') or '').strip()
-        image_url = str((message or {}).get('image_url') or '').strip()
-        if content or image_url:
-            renderable_count += 1
-
-    return renderable_count == 0
-
-
 def _normalize_chat_history_message_record(
     raw: Dict[str, Any],
     cookie_id: str,
@@ -3138,160 +3123,6 @@ def _annotate_chat_sessions(cookie_id: str, sessions: List[Dict[str, Any]]) -> L
     for session in sessions or []:
         annotated.append(_apply_chat_history_probe_to_session(cookie_id, session))
     return annotated
-
-
-async def _hydrate_chat_history_from_goofish(cookie_id: str, chat_id: str, page_size: int = 50) -> Dict[str, Any]:
-    """从闲鱼拉取已知会话历史消息并回填到本地库。"""
-    from XianyuAutoAsync import XianyuLive
-
-    live_instance = XianyuLive.get_instance(cookie_id)
-    if not live_instance:
-        logger.warning(f"聊天历史补拉失败：账号未启动，cookie_id={cookie_id}, chat_id={chat_id}")
-        raise HTTPException(status_code=400, detail="账号未启动，暂无法拉取历史消息")
-
-    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
-    if not normalized_chat_id:
-        logger.warning(f"聊天历史补拉失败：缺少会话ID，cookie_id={cookie_id}, raw_chat_id={chat_id}")
-        raise HTTPException(status_code=400, detail="缺少会话ID")
-
-    runtime_status = _build_live_runtime_status(cookie_id)
-    logger.info(
-        f"开始补拉聊天历史: cookie_id={cookie_id}, chat_id={normalized_chat_id}, page_size={page_size}, "
-        f"connection_state={runtime_status.get('connection_state')}, ws_ready={runtime_status.get('ws_ready')}, "
-        f"session_ready={runtime_status.get('session_ready')}, message_stream_ready={runtime_status.get('message_stream_ready')}"
-    )
-
-    history_messages = await _run_live_instance_on_manager_loop(
-        cookie_id,
-        lambda: live_instance.fetch_conversation_history_with_fallback(
-            normalized_chat_id,
-            page_size=max(1, min(page_size, 100)),
-            isolated_timeout=12,
-        ),
-        timeout=60,
-    )
-
-    logger.info(
-        f"聊天历史补拉返回: cookie_id={cookie_id}, chat_id={normalized_chat_id}, fetched={len(history_messages or [])}"
-    )
-
-    recent_order = db_manager.get_recent_order_by_sid(f"{normalized_chat_id}@goofish", cookie_id=cookie_id, minutes=10080)
-    fallback_item_id = recent_order.get('item_id') if recent_order else None
-    owner_user_id = str(getattr(live_instance, 'myid', '') or '').strip()
-    if fallback_item_id:
-        logger.info(
-            f"聊天历史补拉匹配到商品上下文: cookie_id={cookie_id}, chat_id={normalized_chat_id}, item_id={fallback_item_id}"
-        )
-    else:
-        logger.info(
-            f"聊天历史补拉未匹配到商品上下文: cookie_id={cookie_id}, chat_id={normalized_chat_id}"
-        )
-
-    normalized_count = 0
-    skipped_count = 0
-    sample_sender_id = None
-    sample_sender_name = None
-    sample_content = None
-
-    existing_messages = db_manager.get_chat_messages(cookie_id, normalized_chat_id, limit=2000)
-    existing_signatures = {
-        _build_chat_message_signature(message)
-        for message in existing_messages
-    }
-    saved_count = 0
-    for index, raw in enumerate(history_messages):
-        record = _normalize_chat_history_message_record(
-            raw,
-            cookie_id,
-            normalized_chat_id,
-            owner_user_id=owner_user_id,
-            fallback_item_id=fallback_item_id,
-        )
-        if not record:
-            skipped_count += 1
-            continue
-        normalized_count += 1
-        if sample_sender_id is None:
-            sample_sender_id = record.get('sender_id')
-            sample_sender_name = record.get('sender_name')
-            sample_content = str(record.get('content') or '')[:80]
-        signature = _build_chat_message_signature(record)
-        if signature in existing_signatures:
-            skipped_count += 1
-            continue
-        msg_id = db_manager.save_chat_message(**record)
-        if msg_id:
-            saved_count += 1
-            existing_signatures.add(signature)
-        else:
-            logger.warning(
-                f"聊天历史入库返回空ID: cookie_id={cookie_id}, chat_id={normalized_chat_id}, index={index}, "
-                f"sender_id={record.get('sender_id')}, content_type={record.get('content_type')}"
-            )
-
-    if history_messages and normalized_count == 0:
-        logger.warning(
-            f"聊天历史补拉拿到数据但全部归一化失败: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
-            f"fetched={len(history_messages)}, skipped={skipped_count}, sample_keys={list(history_messages[0].keys())[:8]}"
-        )
-
-    if not history_messages:
-        probe = _set_cached_chat_history_probe(
-            cookie_id,
-            normalized_chat_id,
-            status='empty',
-            fetched=0,
-            normalized_count=normalized_count,
-            saved=saved_count,
-            note='闲鱼返回空历史列表，当前会话可能只是订单候选入口',
-        )
-        logger.warning(
-            f"聊天历史补拉返回空列表: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
-            f"connection_state={runtime_status.get('connection_state')}, ws_ready={runtime_status.get('ws_ready')}, "
-            f"session_ready={runtime_status.get('session_ready')}"
-        )
-    else:
-        probe_status = 'available' if normalized_count > 0 or saved_count > 0 else 'unrenderable'
-        probe_note = None
-        if probe_status == 'unrenderable':
-            probe_note = '闲鱼返回了历史，但未能转成可展示的本地消息'
-        probe = _set_cached_chat_history_probe(
-            cookie_id,
-            normalized_chat_id,
-            status=probe_status,
-            fetched=len(history_messages or []),
-            normalized_count=normalized_count,
-            saved=saved_count,
-            note=probe_note,
-        )
-
-    return {
-        'success': True,
-        'chat_id': normalized_chat_id,
-        'fetched': len(history_messages or []),
-        'saved': saved_count,
-        'normalized_count': normalized_count,
-        'skipped_count': skipped_count,
-        'sample_sender_id': sample_sender_id,
-        'sample_sender_name': sample_sender_name,
-        'sample_content': sample_content,
-        'remote_history_status': probe.get('status') if probe else None,
-        'remote_history_checked_at': probe.get('checked_at_display') if probe else None,
-        'messages': db_manager.get_chat_messages(cookie_id, normalized_chat_id, limit=min(page_size, 100)),
-        'runtime_status': runtime_status,
-    }
-
-
-async def _rebuild_chat_history_from_goofish(cookie_id: str, chat_id: str, page_size: int = 50) -> Dict[str, Any]:
-    """删除本地会话旧记录后，重新从闲鱼补拉历史。"""
-    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
-    deleted = db_manager.delete_chat_messages_by_session(cookie_id, normalized_chat_id)
-    logger.info(
-        f"开始重建聊天历史: cookie_id={cookie_id}, chat_id={normalized_chat_id}, deleted_local={deleted}, page_size={page_size}"
-    )
-    result = await _hydrate_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=page_size)
-    result['deleted_local'] = deleted
-    return result
 
 
 def _get_user_cookies_map(current_user: Dict[str, Any]) -> Dict[str, str]:
@@ -11578,123 +11409,20 @@ async def get_chat_messages(
     chat_id: str = None,
     limit: int = 50,
     before_id: int = None,
-    hydrate_remote: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """获取指定会话的消息列表"""
+    """获取指定会话的消息列表（仅读本地 DB，新消息走 /api/chat/stream 实时推送）"""
     try:
         if not cookie_id or not chat_id:
             raise HTTPException(status_code=400, detail="缺少 cookie_id 或 chat_id 参数")
         cookie_id = _ensure_cookie_access(cookie_id, current_user)
         messages = db_manager.get_chat_messages(cookie_id, chat_id, limit=min(limit, 100), before_id=before_id)
-        if hydrate_remote and not before_id and _messages_need_remote_hydration(messages):
-            logger.info(
-                f"聊天消息命中远端补拉条件: cookie_id={cookie_id}, chat_id={chat_id}, local_count={len(messages)}"
-            )
-            hydrated = await _hydrate_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
-            messages = hydrated.get('messages', [])
         return {'success': True, 'messages': messages}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"获取聊天消息失败: {mask_sensitive_text(e)}")
         raise HTTPException(status_code=500, detail="获取聊天消息失败")
-
-
-@app.post('/api/chat/messages/hydrate')
-async def hydrate_chat_messages(
-    cookie_id: str,
-    chat_id: str,
-    limit: int = 50,
-    rebuild: bool = False,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    """按需从闲鱼拉取已知会话历史消息并写回本地。"""
-    try:
-        cookie_id = _ensure_cookie_access(cookie_id, current_user)
-        if rebuild:
-            return await _rebuild_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
-        return await _hydrate_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"回填聊天历史失败: {mask_sensitive_text(e)}")
-        raise HTTPException(status_code=500, detail=safe_client_error("回填聊天历史失败，请稍后重试"))
-
-
-@app.get('/api/chat/messages/hydrate-debug', response_model=ChatHydrationDebug)
-async def hydrate_chat_messages_debug(
-    cookie_id: str,
-    chat_id: str,
-    limit: int = 50,
-    rebuild: bool = False,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    """调试专用：返回聊天历史补拉过程中的关键诊断信息。"""
-    cookie_id = _ensure_cookie_access(cookie_id, current_user)
-    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
-    runtime_status = _build_live_runtime_status(cookie_id)
-
-    try:
-        if rebuild:
-            result = await _rebuild_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=min(limit, 100))
-        else:
-            result = await _hydrate_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=min(limit, 100))
-        message = '补拉成功'
-        if result.get('fetched', 0) == 0:
-            message = '补拉请求成功，但闲鱼返回空历史列表'
-        elif result.get('normalized_count', 0) == 0:
-            message = '闲鱼返回了数据，但未能成功归一化为本地聊天记录'
-        elif result.get('saved', 0) == 0:
-            message = '历史消息已归一化，但未成功写入本地库'
-        elif rebuild:
-            message = f"会话已重建，本地旧记录删除 {result.get('deleted_local', 0)} 条"
-
-        return ChatHydrationDebug(
-            success=True,
-            cookie_id=cookie_id,
-            chat_id=normalized_chat_id,
-            stage='completed',
-            message=message,
-            fetched=result.get('fetched', 0),
-            saved=result.get('saved', 0),
-            normalized_count=result.get('normalized_count', 0),
-            skipped_count=result.get('skipped_count', 0),
-            sample_sender_id=result.get('sample_sender_id'),
-            sample_sender_name=result.get('sample_sender_name'),
-            sample_content=result.get('sample_content'),
-            remote_history_status=result.get('remote_history_status'),
-            remote_history_checked_at=result.get('remote_history_checked_at'),
-            runtime_status=result.get('runtime_status') or runtime_status,
-        )
-    except HTTPException as exc:
-        logger.warning(
-            f"聊天历史补拉调试失败: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
-            f"status={exc.status_code}, detail={mask_sensitive_text(exc.detail)}"
-        )
-        return ChatHydrationDebug(
-            success=False,
-            cookie_id=cookie_id,
-            chat_id=normalized_chat_id,
-            stage='http_error',
-            message=str(exc.detail),
-            remote_history_status='http_error',
-            runtime_status=runtime_status,
-        )
-    except Exception as exc:
-        logger.error(
-            f"聊天历史补拉调试异常: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
-            f"error={mask_sensitive_text(exc)}"
-        )
-        return ChatHydrationDebug(
-            success=False,
-            cookie_id=cookie_id,
-            chat_id=normalized_chat_id,
-            stage='exception',
-            message=safe_client_error('补拉调试发生异常，请查看后端日志'),
-            remote_history_status='exception',
-            runtime_status=runtime_status,
-        )
 
 
 @app.post('/api/chat/send')

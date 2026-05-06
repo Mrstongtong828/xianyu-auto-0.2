@@ -20658,31 +20658,6 @@ function resolveSessionPreview(session) {
 }
 
 function getChatSessionState(session) {
-    const status = String(session?.remote_history_status || '').trim();
-    if (status === 'empty') {
-        return {
-            tag: '无历史',
-            preview: '该订单候选会话未发现可补拉的闲鱼聊天历史',
-            submeta: session?.remote_history_checked_at ? `最近验证: ${session.remote_history_checked_at}` : '已验证为空历史',
-            className: 'empty-history'
-        };
-    }
-    if (status === 'unrenderable') {
-        return {
-            tag: '待适配',
-            preview: '闲鱼返回了历史，但当前版本暂未成功解析成可展示消息',
-            submeta: session?.remote_history_checked_at ? `最近验证: ${session.remote_history_checked_at}` : '历史已返回但不可展示',
-            className: 'unrenderable-history'
-        };
-    }
-    if (session?.hydration_source === 'orders') {
-        return {
-            tag: '候选',
-            preview: '订单推断会话，可尝试补拉闲鱼聊天历史',
-            submeta: session?.remote_history_note || '当前仅根据订单信息推断，未确认存在真实聊天历史',
-            className: 'candidate-only'
-        };
-    }
     return {
         tag: '',
         preview: resolveSessionPreview(session),
@@ -20709,7 +20684,6 @@ function updateChatHeaderMeta(session) {
 function scoreChatSession(session) {
     const preview = normalizeChatSessionPreview(session?.content, session?.content_type);
     let score = 0;
-    if (session?.hydration_source === 'orders') score += 5;
     if (preview !== '[系统/占位消息]' && preview !== '[暂无文本内容]') score += 20;
     if (String(session?.buyer_name || '').trim()) score += 8;
     if (String(session?.item_id || '').trim()) score += 4;
@@ -20827,12 +20801,11 @@ function buildChatSessionsFromOrdersData(orders, cookieId) {
             buyer_id: order.buyer_id || '',
             sender_name: order.buyer_nick || order.buyer_id || chatId,
             buyer_name: order.buyer_nick || '',
-            content: '点击补拉该会话历史消息',
+            content: '',
             content_type: 1,
             item_id: order.item_id || '',
             direction: 2,
             created_at: order.updated_at || order.platform_created_at || order.created_at || '',
-            hydration_source: 'orders',
         });
     });
     sessions.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -20871,13 +20844,12 @@ function renderChatSessions(sessions) {
         const avatar = resolveSessionAvatar(session);
         const sessionState = getChatSessionState(session);
         const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 30);
-        const hydrationHint = sessionState.tag ? `<span class="chat-session-tag ${escapeHtml(sessionState.className)}">${escapeHtml(sessionState.tag)}</span>` : '';
         const baseSubMeta = String(sessionState.submeta || '').trim();
         const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
         div.innerHTML = `
             <div class="chat-session-avatar">${avatar.type === 'image' ? `<img src="${escapeHtml(avatar.value)}" alt="avatar" class="chat-session-avatar-image">` : escapeHtml(avatar.value)}</div>
             <div class="chat-session-info">
-                <div class="chat-session-name">${escapeHtml(displayName)}${hydrationHint}</div>
+                <div class="chat-session-name">${escapeHtml(displayName)}</div>
                 <div class="chat-session-preview">${escapeHtml(preview)}</div>
                 <div class="chat-session-submeta">${escapeHtml(baseSubMeta)}${priceMeta}</div>
             </div>
@@ -20949,7 +20921,7 @@ async function selectChatSession(session) {
     updateChatHeaderMeta(session);
 
     renderChatSessions(chatSessionsCache);
-    await loadChatMessages(false, shouldForceHydrateSession(session));
+    await loadChatMessages(false);
 
     try {
         const result = await fetchJSON(`${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
@@ -20983,46 +20955,18 @@ async function selectChatSession(session) {
 }
 
 function shouldForceHydrateSession(session) {
-    if (!session) return false;
-    if (session.remote_history_status === 'empty') return false;
-    if (session.hydration_source === 'orders') return true;
-    const content = String(session.content || '').trim();
-    if (!content || content === '点击补拉该会话历史消息' || content === '[系统消息]') return true;
     return false;
 }
 
 function shouldRebuildEmptySession(messages) {
-    if (!Array.isArray(messages) || !messages.length) return false;
-    let renderableCount = 0;
-    for (const message of messages) {
-        const content = String(message?.content || '').trim();
-        const imageUrl = String(message?.image_url || '').trim();
-        if (imageUrl) {
-            renderableCount += 1;
-            continue;
-        }
-        if (content && content !== '[空消息]') {
-            renderableCount += 1;
-        }
-    }
-    return renderableCount === 0;
+    return false;
 }
 
-function renderChatEmptyState(session, debug) {
-    const status = String(debug?.remote_history_status || session?.remote_history_status || '').trim();
-    const checkedAt = String(debug?.remote_history_checked_at || session?.remote_history_checked_at || '').trim();
-    const detail = String(debug?.message || '').trim();
-    if (status === 'empty') {
-        const checkedText = checkedAt ? `最近验证时间：${checkedAt}` : '该会话已验证为空历史';
-        return `<div class="text-center text-muted py-4"><div class="small mb-2">这是订单推断出来的候选会话，当前未发现可补拉的闲鱼聊天历史</div><div class="small text-warning">${escapeHtml(checkedText)}</div></div>`;
-    }
-    if (status === 'unrenderable') {
-        return `<div class="text-center text-muted py-4"><div class="small mb-2">闲鱼返回了历史消息，但当前版本还不能完整展示该会话内容</div><div class="small text-warning">${escapeHtml(detail || '请查看后端日志继续适配消息结构')}</div></div>`;
-    }
-    return `<div class="text-center text-muted py-4"><div class="small mb-2">暂无本地消息记录，也未能从闲鱼补拉到该会话历史</div><div class="small text-warning">${escapeHtml(detail || '补拉诊断已输出到控制台')}</div></div>`;
+function renderChatEmptyState(session) {
+    return `<div class="text-center text-muted py-4"><div class="small">暂无消息记录</div></div>`;
 }
 
-async function loadChatMessages(append = false, forceHydrate = false) {
+async function loadChatMessages(append = false) {
     if (!chatCurrentCookieId || !chatCurrentChatId) return;
     const area = document.getElementById('chatMessagesArea');
     if (!area) return;
@@ -21035,53 +20979,10 @@ async function loadChatMessages(append = false, forceHydrate = false) {
         if (append && chatOldestMsgId) {
             url += `&before_id=${chatOldestMsgId}`;
         }
-        if (!append && forceHydrate) {
-            url += '&hydrate_remote=true';
-        }
         const result = await fetchJSON(url);
         if (!result.success) {
             if (!append) area.innerHTML = '<div class="text-center text-muted py-4">加载失败</div>';
             return;
-        }
-        if (!append && shouldRebuildEmptySession(result.messages) && chatCurrentCookieId && chatCurrentChatId) {
-            try {
-                const rebuilt = await fetchJSON(`${apiBase}/api/chat/messages/hydrate?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50&rebuild=true`, {
-                    method: 'POST'
-                });
-                if (rebuilt?.success && Array.isArray(rebuilt.messages) && rebuilt.messages.length) {
-                    const rebuiltMessages = rebuilt.messages || [];
-                    if (rebuiltMessages.length > 0) {
-                        chatOldestMsgId = rebuiltMessages[0].id;
-                    }
-                    area.innerHTML = renderChatMessages(rebuiltMessages);
-                    area.scrollTop = area.scrollHeight;
-                    return;
-                }
-            } catch (rebuildError) {
-                console.warn('重建聊天历史失败:', rebuildError);
-            }
-        }
-
-        if (!append && shouldRebuildEmptySession(result.messages) && chatCurrentCookieId && chatCurrentChatId) {
-            try {
-                const debug = await fetchJSON(`${apiBase}/api/chat/messages/hydrate-debug?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50&rebuild=true`);
-                console.warn('聊天历史补拉调试信息:', debug);
-                area.innerHTML = renderChatEmptyState(chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {}, debug);
-                return;
-            } catch (debugError) {
-                console.error('获取聊天历史调试信息失败:', debugError);
-            }
-        }
-
-        if (!append && result.messages && result.messages.length === 0 && chatCurrentCookieId && chatCurrentChatId) {
-            try {
-                const debug = await fetchJSON(`${apiBase}/api/chat/messages/hydrate-debug?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
-                console.warn('聊天历史补拉调试信息:', debug);
-                area.innerHTML = renderChatEmptyState(chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {}, debug);
-                return;
-            } catch (debugError) {
-                console.error('获取聊天历史调试信息失败:', debugError);
-            }
         }
         const messages = result.messages || [];
         if (messages.length > 0) {
@@ -21096,20 +20997,12 @@ async function loadChatMessages(append = false, forceHydrate = false) {
                 area.innerHTML = renderChatMessages(messages);
             } else {
                 const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
-                area.innerHTML = renderChatEmptyState(currentSession, currentSession);
+                area.innerHTML = renderChatEmptyState(currentSession);
             }
             area.scrollTop = area.scrollHeight;
         }
     } catch (error) {
         console.error('加载消息失败:', error);
-        if (!append && chatCurrentCookieId && chatCurrentChatId) {
-            try {
-                const debug = await fetchJSON(`${apiBase}/api/chat/messages/hydrate-debug?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
-                console.warn('聊天历史补拉调试信息:', debug);
-            } catch (debugError) {
-                console.error('获取聊天历史调试信息失败:', debugError);
-            }
-        }
         if (!append) area.innerHTML = '<div class="text-center text-muted py-4">加载失败</div>';
     }
 }
