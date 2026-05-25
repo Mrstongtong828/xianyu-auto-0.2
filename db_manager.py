@@ -323,6 +323,7 @@ class DBManager:
                 value TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 auto_confirm INTEGER DEFAULT 1,
+                auto_red_flower INTEGER DEFAULT 0,
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
                 qr_login_grace_until INTEGER DEFAULT 0,
@@ -471,6 +472,9 @@ class DBManager:
                 is_rated INTEGER DEFAULT 0,
                 rated_at TIMESTAMP,
                 rate_error TEXT,
+                is_red_flower INTEGER DEFAULT 0,
+                red_flower_at TIMESTAMP,
+                red_flower_error TEXT,
                 cookie_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -941,6 +945,7 @@ Cookie数量: {cookie_count}
             ('verification_email_api_url', '', '验证码邮件 API 地址（留空则仅使用 SMTP，不再向旧硬编码地址外发）'),
             ('qq_notification_api_url', '', 'QQ 私信通知 API 地址（留空则禁用 QQ 私信通知）'),
             ('auto_comment_api_url', '', '自动好评辅助 API 地址（留空则禁用此功能，避免 Cookie 外发）'),
+            ('auto_red_flower_interval_seconds', '300', '自动求小红花后台任务检查间隔秒数'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
             ''')
 
@@ -1003,10 +1008,16 @@ Cookie数量: {cookie_count}
                 cursor.execute("ALTER TABLE cookies ADD COLUMN auto_comment INTEGER DEFAULT 0")
                 logger.info("数据库迁移完成：添加auto_comment列")
 
+            if 'auto_red_flower' not in cookie_columns:
+                logger.info("添加cookies表的auto_red_flower列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN auto_red_flower INTEGER DEFAULT 0")
+                logger.info("数据库迁移完成：添加auto_red_flower列")
+
             # 历史版本可能缺少订单平台时间字段，不能再依赖旧版本号分支触发
             self._ensure_orders_platform_time_columns(cursor)
             self._ensure_orders_auto_comment_columns(cursor)
             self._ensure_scheduled_rate_logs_table(cursor)
+            self._ensure_scheduled_red_flower_logs_table(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
@@ -1079,6 +1090,9 @@ Cookie数量: {cookie_count}
             "is_rated": "INTEGER DEFAULT 0",
             "rated_at": "TIMESTAMP",
             "rate_error": "TEXT",
+            "is_red_flower": "INTEGER DEFAULT 0",
+            "red_flower_at": "TIMESTAMP",
+            "red_flower_error": "TEXT",
         }
         for column_name, column_def in column_defs.items():
             try:
@@ -1087,6 +1101,7 @@ Cookie数量: {cookie_count}
                 self._execute_sql(cursor, f"ALTER TABLE orders ADD COLUMN {column_name} {column_def}")
                 logger.info(f"为orders表添加自动评价字段({column_name})")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_orders_auto_comment ON orders(cookie_id, order_status, is_rated, updated_at)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_orders_red_flower ON orders(cookie_id, order_status, is_red_flower, updated_at)")
 
     def _ensure_scheduled_rate_logs_table(self, cursor):
         """创建自动评价执行日志表。"""
@@ -1110,6 +1125,28 @@ Cookie数量: {cookie_count}
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_cookie_time ON scheduled_rate_logs(cookie_id, created_at DESC)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_batch ON scheduled_rate_logs(batch_id)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_order ON scheduled_rate_logs(order_id)")
+
+    def _ensure_scheduled_red_flower_logs_table(self, cursor):
+        """创建求小红花执行日志表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS scheduled_red_flower_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            order_id TEXT,
+            item_id TEXT,
+            buyer_id TEXT,
+            buyer_nick TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            raw_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_cookie_time ON scheduled_red_flower_logs(cookie_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_batch ON scheduled_red_flower_logs(batch_id)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_order ON scheduled_red_flower_logs(order_id)")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -2497,6 +2534,39 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"获取自动确认发货设置失败: {e}")
                 return True  # 出错时默认开启
+
+    # -------------------- 自动求小红花操作 --------------------
+    def get_auto_red_flower(self, cookie_id: str) -> bool:
+        """获取Cookie的自动求小红花设置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT auto_red_flower FROM cookies WHERE id = ?", (cookie_id,))
+                result = cursor.fetchone()
+                if result and result[0] is not None:
+                    return bool(result[0])
+                return False
+            except Exception as e:
+                logger.error(f"获取自动求小红花设置失败: {e}")
+                return False
+
+    def update_auto_red_flower(self, cookie_id: str, auto_red_flower: bool) -> bool:
+        """更新Cookie的自动求小红花设置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET auto_red_flower = ? WHERE id = ?",
+                    (int(auto_red_flower), cookie_id)
+                )
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 自动求小红花设置: {'开启' if auto_red_flower else '关闭'}")
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新自动求小红花设置失败: {e}")
+                self.conn.rollback()
+                return False
 
     # -------------------- 自动好评操作 --------------------
     def get_auto_comment(self, cookie_id: str) -> bool:
@@ -7049,7 +7119,8 @@ Cookie数量: {cookie_count}
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
                        spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected,
                        order_status, pre_refund_status, cookie_id, platform_created_at, platform_paid_at,
-                       platform_completed_at, is_rated, rated_at, rate_error, created_at, updated_at
+                       platform_completed_at, is_rated, rated_at, rate_error,
+                       is_red_flower, red_flower_at, red_flower_error, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -7078,8 +7149,11 @@ Cookie数量: {cookie_count}
                         'is_rated': bool(row[19]),
                         'rated_at': row[20],
                         'rate_error': row[21],
-                        'created_at': row[22],
-                        'updated_at': row[23]
+                        'is_red_flower': bool(row[22]),
+                        'red_flower_at': row[23],
+                        'red_flower_error': row[24],
+                        'created_at': row[25],
+                        'updated_at': row[26]
                     }
                 return None
 
@@ -7141,7 +7215,8 @@ Cookie数量: {cookie_count}
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
                        spec_name_2, spec_value_2, quantity, amount, order_status,
                        platform_created_at, platform_paid_at, platform_completed_at,
-                       is_rated, rated_at, rate_error, created_at, updated_at
+                       is_rated, rated_at, rate_error,
+                       is_red_flower, red_flower_at, red_flower_error, created_at, updated_at
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -7170,8 +7245,11 @@ Cookie数量: {cookie_count}
                         'is_rated': bool(row[15]),
                         'rated_at': row[16],
                         'rate_error': row[17],
-                        'created_at': row[18],
-                        'updated_at': row[19]
+                        'is_red_flower': bool(row[18]),
+                        'red_flower_at': row[19],
+                        'red_flower_error': row[20],
+                        'created_at': row[21],
+                        'updated_at': row[22]
                     })
 
                 return orders
@@ -7201,6 +7279,30 @@ Cookie数量: {cookie_count}
                 return cursor.rowcount > 0
             except Exception as e:
                 logger.error(f"更新订单评价状态失败: order_id={order_id}, error={e}")
+                self.conn.rollback()
+                return False
+
+    def mark_order_red_flower(self, order_id: str, is_red_flower: bool = True, error_message: str = None) -> bool:
+        """更新订单求小红花状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if is_red_flower:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET is_red_flower = 1, red_flower_at = CURRENT_TIMESTAMP, red_flower_error = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (order_id,))
+                else:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET red_flower_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (str(error_message or '')[:1000], order_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新订单求小红花状态失败: order_id={order_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7328,6 +7430,131 @@ Cookie数量: {cookie_count}
                 return orders
             except Exception as e:
                 logger.error(f"查询待自动评价订单失败: cookie_id={cookie_id}, error={e}")
+                return []
+
+    def add_scheduled_red_flower_log(self, batch_id: str, cookie_id: str, order_id: str = None,
+                                     item_id: str = None, buyer_id: str = None, buyer_nick: str = None,
+                                     status: str = 'failed', message: str = None,
+                                     raw_response: Any = None) -> Optional[int]:
+        """写入求小红花执行日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if raw_response is None:
+                    raw_text = None
+                elif isinstance(raw_response, str):
+                    raw_text = raw_response
+                else:
+                    raw_text = json.dumps(raw_response, ensure_ascii=False, default=str)
+                cursor.execute('''
+                INSERT INTO scheduled_red_flower_logs (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    status, message, raw_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    status, message, raw_text
+                ))
+                log_id = cursor.lastrowid
+                self.conn.commit()
+                return log_id
+            except Exception as e:
+                logger.error(f"写入求小红花日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_scheduled_red_flower_logs(self, user_id: int = None, cookie_id: str = None,
+                                      limit: int = 100, offset: int = 0) -> List[Dict]:
+        """查询求小红花日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append("c.user_id = ?")
+                    params.append(user_id)
+                if cookie_id:
+                    conditions.append("l.cookie_id = ?")
+                    params.append(cookie_id)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                params.extend([max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))])
+                cursor.execute(f'''
+                SELECT l.id, l.batch_id, l.cookie_id, l.order_id, l.item_id, l.buyer_id,
+                       l.buyer_nick, l.status, l.message, l.raw_response, l.created_at
+                FROM scheduled_red_flower_logs l
+                LEFT JOIN cookies c ON c.id = l.cookie_id
+                {where_sql}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+                ''', params)
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'id': row[0],
+                        'batch_id': row[1],
+                        'cookie_id': row[2],
+                        'order_id': row[3],
+                        'item_id': row[4],
+                        'buyer_id': row[5],
+                        'buyer_nick': row[6],
+                        'status': row[7],
+                        'message': row[8],
+                        'raw_response': row[9],
+                        'created_at': row[10],
+                    })
+                return logs
+            except Exception as e:
+                logger.error(f"查询求小红花日志失败: {e}")
+                return []
+
+    def get_pending_red_flower_orders(self, cookie_id: str, limit: int = 5,
+                                      days: int = 10, cooldown_minutes: int = 30) -> List[Dict]:
+        """获取待自动求小红花订单。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid,
+                       o.order_status, o.cookie_id, o.platform_completed_at, o.created_at, o.updated_at,
+                       o.is_red_flower, o.red_flower_at, o.red_flower_error
+                FROM orders o
+                WHERE o.cookie_id = ?
+                  AND o.order_status NOT IN ('cancelled', 'processing', 'pending_payment')
+                  AND COALESCE(o.is_red_flower, 0) = 0
+                  AND datetime(COALESCE(o.platform_created_at, o.platform_paid_at, o.created_at)) >= datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduled_red_flower_logs l
+                      WHERE l.order_id = o.order_id
+                        AND l.status IN ('failed', 'cookie_expired')
+                        AND datetime(l.created_at) >= datetime('now', ?)
+                  )
+                ORDER BY datetime(COALESCE(o.platform_created_at, o.platform_paid_at, o.created_at)) ASC
+                LIMIT ?
+                ''', (cookie_id, f'-{max(1, int(days or 10))} days', f'-{max(1, int(cooldown_minutes or 30))} minutes', max(1, min(int(limit or 5), 50))))
+                orders = []
+                for row in cursor.fetchall():
+                    buyer_nick = self._sanitize_order_buyer_nick(row[3])
+                    if not buyer_nick:
+                        buyer_nick = self._lookup_buyer_nick_from_chat_messages(cookie_id, row[4], row[2])
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': buyer_nick,
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'cookie_id': row[6],
+                        'platform_completed_at': row[7],
+                        'created_at': row[8],
+                        'updated_at': row[9],
+                        'is_red_flower': bool(row[10]),
+                        'red_flower_at': row[11],
+                        'red_flower_error': row[12],
+                    })
+                return orders
+            except Exception as e:
+                logger.error(f"查询待求小红花订单失败: cookie_id={cookie_id}, error={e}")
                 return []
 
     def delete_order(self, order_id: str, cookie_id: str = None) -> bool:

@@ -4180,6 +4180,9 @@ async function loadCookies() {
         // 自动好评状态（默认关闭）
         const autoComment = cookie.auto_comment === undefined ? false : cookie.auto_comment;
 
+        // 自动求小红花状态（默认关闭）
+        const autoRedFlower = cookie.auto_red_flower === undefined ? false : cookie.auto_red_flower;
+
         tr.innerHTML = `
         <td class="align-middle">
             <div class="cookie-id">
@@ -4197,14 +4200,16 @@ async function loadCookies() {
             </span>
         </td>
         <td class="align-middle">
-            <div class="d-flex align-items-center gap-2 flex-wrap account-status-cell">
-            <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
-                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
-                <span class="status-slider"></span>
-            </label>
-            <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
-                <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
-            </span>
+            <div class="account-status-cell">
+            <div class="account-status-main">
+                <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
+                    <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
+                    <span class="status-slider"></span>
+                </label>
+                <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
+                    <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
+                </span>
+            </div>
             ${statusNoteBadge}
             </div>
         </td>
@@ -4253,30 +4258,49 @@ async function loadCookies() {
                 </span>
             </div>
         </td>
-        <td class="align-middle">
-            <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="验证截图">
-                <i class="bi bi-shield-check"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-pencil"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
-                <i class="bi bi-arrow-right-circle"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-robot"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${cookie.id}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-stars"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${cookie.id}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-clock"></i>
-            </button>
-
-            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
-                <i class="bi bi-trash"></i>
-            </button>
+        <td class="align-middle account-actions-cell">
+            <div class="account-actions-toolbar" role="group" aria-label="账号操作">
+            <div class="account-action-group account-action-group-basic" aria-label="基础操作">
+                <span class="account-action-group-label">基础</span>
+                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="showFaceVerification('${cookie.id}')" title="查看验证截图" data-action="face-verification">
+                    <i class="bi bi-shield-check"></i><span class="action-text">验证</span>
+                </button>
+                <button class="btn btn-sm btn-outline-primary account-action-btn" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改账号信息与Cookie" data-action="edit-cookie" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-pencil"></i><span class="action-text">编辑</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-reply" aria-label="回复配置">
+                <span class="account-action-group-label">回复</span>
+                <button class="btn btn-sm btn-outline-success account-action-btn" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}" data-action="auto-reply">
+                    <i class="bi bi-chat-dots"></i><span class="action-text">规则</span>
+                </button>
+                <button class="btn btn-sm btn-outline-warning account-action-btn" onclick="configAIReply('${cookie.id}')" title="配置AI回复" data-action="ai-reply" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-robot"></i><span class="action-text">AI</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-item" aria-label="商品操作">
+                <span class="account-action-group-label">商品</span>
+                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="polishAccountItems('${cookie.id}')" title="立即擦亮全部商品" data-action="polish-items" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-stars"></i><span class="action-text">擦亮</span>
+                </button>
+                <button class="btn btn-sm btn-outline-info account-action-btn" onclick="openPolishScheduleModal('${cookie.id}')" title="设置定时擦亮" data-action="polish-schedule" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-clock"></i><span class="action-text">定时</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-flower" aria-label="小红花操作">
+                <span class="account-action-group-label">小红花</span>
+                <button class="btn btn-sm ${autoRedFlower ? 'btn-outline-danger' : 'btn-outline-secondary'} account-action-btn" onclick="toggleAutoRedFlower('${cookie.id}', ${!autoRedFlower})" title="${autoRedFlower ? '关闭自动求小红花' : '开启自动求小红花'}" data-auto-red-flower-toggle="${cookie.id}" data-auto-red-flower-active="${autoRedFlower ? 'true' : 'false'}">
+                    <i class="bi bi-flower${autoRedFlower ? '1' : '2'}"></i><span class="action-text">${autoRedFlower ? '已开' : '开启'}</span>
+                </button>
+                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runAutoRedFlowerForAccount('${cookie.id}')" title="立即执行求小红花" data-red-flower-run="${cookie.id}" data-red-flower-active="${autoRedFlower ? 'true' : 'false'}" ${(!isEnabled || !autoRedFlower) ? 'disabled' : ''}>
+                    <i class="bi bi-send-fill"></i><span class="action-text">执行</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-danger" aria-label="危险操作">
+                <button class="btn btn-sm btn-outline-danger account-action-btn account-action-delete" onclick="delCookie('${cookie.id}')" title="删除账号" data-action="delete-account">
+                    <i class="bi bi-trash"></i><span class="action-text">删除</span>
+                </button>
+            </div>
             </div>
         </td>
         `;
@@ -4727,7 +4751,7 @@ function cancelCookieEdit(id) {
     cookieValueCell.innerHTML = window.editingCookieData.originalContent;
 
     // 恢复按钮状态
-    const actionButtons = row.querySelectorAll('.btn-group button');
+    const actionButtons = row.querySelectorAll('.account-actions-toolbar button, .btn-group button');
     actionButtons.forEach(btn => btn.disabled = false);
 
     // 清理全局数据
@@ -4816,7 +4840,7 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
     const row = toggle.closest('tr');
     const statusBadge = row.querySelector('.status-badge');
     const statusCell = row.querySelector('.account-status-cell');
-    const actionButtons = row.querySelectorAll('.btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
+    const actionButtons = row.querySelectorAll('.account-actions-toolbar .btn[data-requires-enabled="true"], .btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
 
     // 更新行样式
     row.className = `account-row ${enabled ? 'enabled' : 'disabled'}`;
@@ -4837,16 +4861,21 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
         statusCell.insertAdjacentHTML('beforeend', renderedStatusNote);
     }
 
-    // 更新按钮状态（只禁用编辑Cookie按钮，其他按钮保持可用）
+    // 更新依赖账号启用状态的按钮；自动回复规则入口始终可用
     actionButtons.forEach(btn => {
-    if (btn.onclick && btn.onclick.toString().includes('editCookieInline')) {
+    if (btn.dataset.requiresEnabled === 'true') {
         btn.disabled = !enabled;
     }
-    // 设置自动回复按钮始终可用，但更新提示文本
     if (btn.onclick && btn.onclick.toString().includes('goToAutoReply')) {
         btn.title = enabled ? '设置自动回复' : '配置关键词 (账号已禁用)';
     }
     });
+
+    const redFlowerRunButton = row.querySelector('[data-red-flower-run]');
+    if (redFlowerRunButton) {
+        const redFlowerEnabled = redFlowerRunButton.dataset.redFlowerActive === 'true';
+        redFlowerRunButton.disabled = !enabled || !redFlowerEnabled;
+    }
 
     // 更新切换按钮的提示
     const label = toggle.closest('.status-toggle');
@@ -4984,6 +5013,76 @@ function updateAutoCommentRowStatus(accountId, enabled) {
         // 更新切换按钮的提示
         const label = toggle.closest('.status-toggle');
         label.title = enabled ? '点击关闭自动好评' : '点击开启自动好评';
+    }
+}
+
+// 切换自动求小红花状态
+async function toggleAutoRedFlower(accountId, enabled) {
+    try {
+        toggleLoading(true);
+
+        const response = await fetch(`${apiBase}/cookies/${accountId}/auto-red-flower`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ auto_red_flower: enabled })
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+            showToast(result.message || (enabled ? '已开启自动求小红花' : '已关闭自动求小红花'), 'success');
+            await loadCookies();
+        } else {
+            const error = await response.json().catch(() => ({}));
+            showToast(error.detail || '更新自动求小红花设置失败', 'error');
+        }
+    } catch (error) {
+        console.error('切换自动求小红花状态失败:', error);
+        showToast('网络错误，请稍后重试', 'error');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+// 立即执行当前账号的求小红花补偿
+async function runAutoRedFlowerForAccount(accountId) {
+    if (!accountId) {
+        showToast('缺少账号ID', 'warning');
+        return;
+    }
+
+    const confirmed = confirm(`确定要立即为账号「${accountId}」执行一轮求小红花吗？`);
+    if (!confirmed) return;
+
+    toggleLoading(true);
+    showToast('正在执行求小红花，请稍候...', 'info');
+    try {
+        const response = await fetch(`${apiBase}/api/auto-red-flower/run-once`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ cookie_id: accountId })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            showToast(data.detail || data.message || '求小红花执行失败', 'danger');
+            return;
+        }
+        const stats = data?.data?.stats || {};
+        showToast(
+            `求小红花完成：处理 ${stats.orders || 0} 单，成功 ${stats.success || 0}，失败 ${stats.failed || 0}，跳过 ${stats.skipped || 0}`,
+            (stats.failed || 0) > 0 ? 'warning' : 'success'
+        );
+        await loadCookies();
+    } catch (error) {
+        console.error('执行求小红花失败:', error);
+        showToast(`求小红花请求异常: ${error.message}`, 'danger');
+    } finally {
+        toggleLoading(false);
     }
 }
 

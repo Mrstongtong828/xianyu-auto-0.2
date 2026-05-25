@@ -1101,6 +1101,12 @@ async def start_scheduled_task_checker():
         logger.info("自动补评价任务已启动")
     except Exception as exc:
         logger.error(f"自动补评价任务启动失败: {exc}")
+    try:
+        from auto_red_flower_task import auto_red_flower_task_loop
+        asyncio.create_task(auto_red_flower_task_loop())
+        logger.info("自动求小红花任务已启动")
+    except Exception as exc:
+        logger.error(f"自动求小红花任务启动失败: {exc}")
 
 
 # 添加请求日志中间件
@@ -3558,6 +3564,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
         auto_comment = db_manager.get_auto_comment(cookie_id)
+        auto_red_flower = db_manager.get_auto_red_flower(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
@@ -3572,6 +3579,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'auto_comment': auto_comment,
+            'auto_red_flower': auto_red_flower,
             'remark': remark,
             'status_note': status_note,
             'username': username,
@@ -7393,9 +7401,17 @@ class AutoCommentUpdate(BaseModel):
     auto_comment: bool
 
 
+class AutoRedFlowerUpdate(BaseModel):
+    auto_red_flower: bool
+
+
 class AutoCommentOrderRequest(BaseModel):
     cookie_id: Optional[str] = None
     comment: Optional[str] = None
+
+
+class RedFlowerOrderRequest(BaseModel):
+    cookie_id: Optional[str] = None
 
 
 class CommentTemplateCreate(BaseModel):
@@ -7471,6 +7487,56 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
         return {
             "auto_confirm": auto_confirm,
             "message": f"自动确认发货当前{'开启' if auto_confirm else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 自动求小红花相关API ====================
+
+@app.put("/cookies/{cid}/auto-red-flower")
+def update_auto_red_flower(cid: str, update_data: AutoRedFlowerUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号的自动求小红花设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.update_auto_red_flower(cid, update_data.auto_red_flower)
+        if not success:
+            raise HTTPException(status_code=500, detail="更新自动求小红花设置失败")
+
+        return {
+            "msg": "success",
+            "auto_red_flower": update_data.auto_red_flower,
+            "message": f"自动求小红花已{'开启' if update_data.auto_red_flower else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/auto-red-flower")
+def get_auto_red_flower(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号的自动求小红花设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        auto_red_flower = db_manager.get_auto_red_flower(cid)
+        return {
+            "auto_red_flower": auto_red_flower,
+            "message": f"自动求小红花当前{'开启' if auto_red_flower else '关闭'}"
         }
     except HTTPException:
         raise
@@ -11562,6 +11628,7 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
 
 
+
 @app.get('/api/auto-comment/logs')
 def get_auto_comment_logs(
     cookie_id: str = None,
@@ -11671,6 +11738,111 @@ async def run_auto_comment_once(
     except Exception as e:
         log_with_user('error', f"手动触发自动补评价失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"手动触发自动补评价失败: {str(e)}")
+
+
+@app.get('/api/auto-red-flower/logs')
+def get_auto_red_flower_logs(
+    cookie_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询求小红花执行日志。"""
+    try:
+        if cookie_id:
+            cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        logs = db_manager.get_scheduled_red_flower_logs(
+            user_id=current_user['user_id'],
+            cookie_id=cookie_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {"success": True, "data": logs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询求小红花日志失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询求小红花日志失败: {str(e)}")
+
+
+@app.post('/api/orders/{order_id}/red-flower')
+async def request_order_red_flower_once(
+    order_id: str,
+    request: RedFlowerOrderRequest = RedFlowerOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动对指定订单执行一次求小红花。"""
+    try:
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail='订单不存在')
+
+        cookie_id = str(request.cookie_id or order.get('cookie_id') or '').strip()
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if order.get('cookie_id') and order.get('cookie_id') != cookie_id:
+            raise HTTPException(status_code=403, detail='订单不属于该账号')
+
+        from auto_red_flower_task import request_red_flower_once
+
+        result = await request_red_flower_once(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            batch_id=f"manual_red_flower_{uuid.uuid4()}",
+            source='manual',
+        )
+        log_with_user('info', f"手动求小红花: order_id={order_id}, cookie_id={cookie_id}, result={result}", current_user)
+        return {"success": bool(result.get('success')), "data": result, "message": result.get('message')}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动求小红花失败: order_id={order_id}, error={str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动求小红花失败: {str(e)}")
+
+
+@app.post('/api/auto-red-flower/run-once')
+async def run_auto_red_flower_once(
+    request: RedFlowerOrderRequest = RedFlowerOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发一轮当前用户范围内的自动求小红花。"""
+    try:
+        from auto_red_flower_task import request_red_flower_once
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        target_cookie_ids = [request.cookie_id] if request.cookie_id else list(user_cookies.keys())
+        batch_id = f"manual_red_flower_batch_{uuid.uuid4()}"
+        results = []
+        stats = {"batch_id": batch_id, "accounts": 0, "orders": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        for raw_cookie_id in target_cookie_ids:
+            cookie_id = _ensure_cookie_access(raw_cookie_id, current_user)
+            if not db_manager.get_auto_red_flower(cookie_id):
+                continue
+            stats['accounts'] += 1
+            orders = db_manager.get_pending_red_flower_orders(cookie_id, limit=5, days=10, cooldown_minutes=0)
+            for order in orders:
+                stats['orders'] += 1
+                result = await request_red_flower_once(
+                    cookie_id=cookie_id,
+                    order_id=order.get('order_id'),
+                    batch_id=batch_id,
+                    source='manual_batch',
+                )
+                results.append(result)
+                if result.get('success'):
+                    stats['success'] += 1
+                elif result.get('status') in {'skipped', 'already_red_flower'}:
+                    stats['skipped'] += 1
+                else:
+                    stats['failed'] += 1
+                await asyncio.sleep(1)
+
+        return {"success": True, "data": {"stats": stats, "results": results}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动触发自动求小红花失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动触发自动求小红花失败: {str(e)}")
 
 
 @app.get('/api/orders/stream')
