@@ -10967,6 +10967,9 @@ async function submitItemPublishForm() {
         renderItemPublishResult(responseData, true);
         showToast(responseData.message || '商品发布成功', 'success');
         await loadItemPublishLogs();
+        if (typeof refreshItemsData === 'function' && document.getElementById('itemCookieFilter')) {
+            await refreshItemsData();
+        }
     } catch (error) {
         console.error('发布商品失败:', error);
         const errorMessage = error.message || '发布商品失败';

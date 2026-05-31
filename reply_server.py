@@ -9299,8 +9299,10 @@ async def _sync_items_after_publish(
         elif not sync_success and not fallback_success:
             summary_message = "发布成功，但同步最新商品列表失败"
 
+        confirmed_success = bool(item_synced) if published_item_id else (sync_success or fallback_success)
+
         return {
-            "success": sync_success or fallback_success,
+            "success": confirmed_success,
             "message": summary_message,
             "published_item_id": published_item_id,
             "item_synced": item_synced,
@@ -9547,6 +9549,26 @@ async def _publish_product_to_account(
             cookies_str,
             latest_cookies_str,
         )
+
+        if published_item_id:
+            item_detail = json.dumps(
+                {
+                    "title": cleaned_title,
+                    "description": cleaned_description,
+                    "price": str(current_price_value) if current_price_value is not None else "",
+                    "published_item_id": published_item_id,
+                    "source": "product_publish",
+                },
+                ensure_ascii=False,
+            )
+            db_manager.save_item_basic_info(
+                cleaned_account_id,
+                published_item_id,
+                item_title=cleaned_title,
+                item_description=cleaned_description,
+                item_price=str(current_price_value) if current_price_value is not None else "",
+                item_detail=item_detail,
+            )
 
         try:
             sync_result = await _sync_items_after_publish(
