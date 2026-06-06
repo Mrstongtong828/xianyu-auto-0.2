@@ -57,6 +57,32 @@ class StaticJsRequestHelperTests(unittest.TestCase):
         self.assertIn("fetchJSON", load_order_metrics)
         self.assertIn("fetchJSON", load_sales_summary)
 
+    def test_dynamic_inner_html_injection_points_escape_api_data(self):
+        source = read_app_js()
+
+        render_notification_channels = extract_function(source, "renderNotificationChannels")
+        test_ai_reply = extract_function(source, "testAIReply")
+        show_version_info = extract_function(source, "showVersionInfo")
+
+        self.assertIn("${escapeHtml(channel.id)}", render_notification_channels)
+        self.assertIn("${escapeHtml(channel.name)}", render_notification_channels)
+        self.assertIn("${escapeHtml(typeDisplay)}", render_notification_channels)
+        self.assertIn("${configDisplay}", render_notification_channels)
+        self.assertIn("escapeHtml(key)", render_notification_channels)
+        self.assertIn("escapeHtml(displayValue)", render_notification_channels)
+        self.assertIn("escapeHtml(channel.config", render_notification_channels)
+        self.assertNotIn("${channel.name}", render_notification_channels)
+        self.assertNotIn("${typeDisplay}", render_notification_channels)
+
+        self.assertIn("escapeHtml(result.reply", test_ai_reply)
+        self.assertNotIn("testReplyContent.innerHTML = result.reply", test_ai_reply)
+        self.assertIn("escapeHtml(error.message", test_ai_reply)
+
+        self.assertIn("escapeHtml(item.version", show_version_info)
+        self.assertIn("escapeHtml(item.date", show_version_info)
+        self.assertIn("escapeHtml(u)", show_version_info)
+        self.assertIn("escapeHtml(intro)", show_version_info)
+
 
 if __name__ == "__main__":
     unittest.main()

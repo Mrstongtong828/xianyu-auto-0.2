@@ -6685,18 +6685,18 @@ async function testAIReply() {
 
     if (response.ok) {
         const result = await response.json();
-        testReplyContent.innerHTML = result.reply;
+        testReplyContent.innerHTML = escapeHtml(result.reply || '');
         showToast('AI回复测试成功', 'success');
     } else {
         const error = await response.text();
-        testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${error}</span>`;
+        testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${escapeHtml(error)}</span>`;
         showToast(`测试失败: ${error}`, 'danger');
     }
 
     } catch (error) {
     console.error('测试AI回复失败:', error);
     const testReplyContent = document.getElementById('testReplyContent');
-    testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${error.message}</span>`;
+    testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${escapeHtml(error.message)}</span>`;
     showToast('测试AI回复失败', 'danger');
     } finally {
     if (testBtn) { testBtn.disabled = false; testBtn.textContent = '测试回复'; }
@@ -7376,6 +7376,7 @@ function renderNotificationChannels(channels) {
     const typeConfig = channelTypeConfigs[channelType];
     const typeDisplay = typeConfig ? typeConfig.title : channel.type;
     const typeColor = typeConfig ? typeConfig.color : 'secondary';
+    const channelId = Number(channel.id) || 0;
 
     // 解析并显示配置信息
     let configDisplay = '';
@@ -7387,14 +7388,15 @@ function renderNotificationChannels(channels) {
         configDisplay = configEntries.map(([key, value]) => {
             // 隐藏敏感信息
             if (key.includes('password') || key.includes('token') || key.includes('secret')) {
-            return `${key}: ****`;
+            return `${escapeHtml(key)}: ****`;
             }
             // 截断过长的值
-            const displayValue = value.length > 30 ? value.substring(0, 30) + '...' : value;
-            return `${key}: ${displayValue}`;
+            const rawValue = String(value ?? '');
+            const displayValue = rawValue.length > 30 ? rawValue.substring(0, 30) + '...' : rawValue;
+            return `${escapeHtml(key)}: ${escapeHtml(displayValue)}`;
         }).join('<br>');
         } else {
-        configDisplay = channel.config || '无配置';
+        configDisplay = escapeHtml(channel.config || '无配置');
         }
     } catch (e) {
         // 兼容旧格式
@@ -7402,25 +7404,26 @@ function renderNotificationChannels(channels) {
         if (configDisplay.length > 30) {
         configDisplay = configDisplay.substring(0, 30) + '...';
         }
+        configDisplay = escapeHtml(configDisplay);
     }
 
     tr.innerHTML = `
-        <td><strong class="text-primary">${channel.id}</strong></td>
+        <td><strong class="text-primary">${escapeHtml(channel.id)}</strong></td>
         <td>
         <div class="d-flex align-items-center">
             <i class="bi ${typeConfig ? typeConfig.icon : 'bi-bell'} me-2 text-${typeColor}"></i>
-            ${channel.name}
+            ${escapeHtml(channel.name)}
         </div>
         </td>
-        <td><span class="badge bg-${typeColor}">${typeDisplay}</span></td>
+        <td><span class="badge bg-${typeColor}">${escapeHtml(typeDisplay)}</span></td>
         <td><small class="text-muted">${configDisplay}</small></td>
         <td>${statusBadge}</td>
         <td>
         <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editNotificationChannel(${channel.id})" title="编辑">
+            <button class="btn btn-sm btn-outline-primary" onclick="editNotificationChannel(${channelId})" title="编辑">
             <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteNotificationChannel(${channel.id})" title="删除">
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteNotificationChannel(${channelId})" title="删除">
             <i class="bi bi-trash"></i>
             </button>
         </div>
@@ -21406,13 +21409,13 @@ async function showVersionInfo(version) {
                 <div class="mb-3 p-3 rounded-3" style="${bgClass} ${borderColor}">
                     <div class="d-flex align-items-center justify-content-between mb-2">
                         <div>
-                            <span class="badge me-2" style="${badgeStyle} font-size: 14px; padding: 6px 12px;">${item.version}</span>
+                            <span class="badge me-2" style="${badgeStyle} font-size: 14px; padding: 6px 12px;">${escapeHtml(item.version)}</span>
                             ${isLatest ? '<span class="badge bg-success" style="font-size: 12px;">最新</span>' : ''}
                         </div>
-                        ${item.date ? `<small style="color: #888; font-size: 13px;"><i class="bi bi-calendar3 me-1"></i>${item.date}</small>` : ''}
+                        ${item.date ? `<small style="color: #888; font-size: 13px;"><i class="bi bi-calendar3 me-1"></i>${escapeHtml(item.date)}</small>` : ''}
                     </div>
                     <ul class="mb-0 ps-3" style="font-size: 14px; line-height: 1.8; color: #444;">
-                        ${item.updates.map(u => `<li>${u}</li>`).join('')}
+                        ${item.updates.map(u => `<li>${escapeHtml(u)}</li>`).join('')}
                     </ul>
                 </div>
             `;
@@ -21423,7 +21426,7 @@ async function showVersionInfo(version) {
             <div class="mb-3 p-3 rounded-3" style="background: linear-gradient(135deg, #e8f5e9, #c8e6c9); border-left: 4px solid #28a745;">
                 <div class="d-flex align-items-center justify-content-between mb-2">
                     <div>
-                        <span class="badge me-2" style="background: linear-gradient(135deg, #28a745, #20c997); color: #fff; font-size: 14px; padding: 6px 12px;">${version}</span>
+                        <span class="badge me-2" style="background: linear-gradient(135deg, #28a745, #20c997); color: #fff; font-size: 14px; padding: 6px 12px;">${escapeHtml(version)}</span>
                         <span class="badge bg-success" style="font-size: 12px;">当前</span>
                     </div>
                 </div>
@@ -21449,7 +21452,7 @@ async function showVersionInfo(version) {
                         <div class="mb-4">
                             <h6 style="color: #444; font-size: 16px; font-weight: 600;"><i class="bi bi-tag me-2"></i>当前版本</h6>
                             <div class="p-3 rounded-3" style="background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.06);">
-                                <h4 class="mb-0" style="color: #5a67d8; font-size: 24px;">${version}</h4>
+                                <h4 class="mb-0" style="color: #5a67d8; font-size: 24px;">${escapeHtml(version)}</h4>
                             </div>
                         </div>
                         
@@ -21459,7 +21462,7 @@ async function showVersionInfo(version) {
                             <div class="p-3 rounded-3" style="background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.06);">
                                 <div style="font-size: 15px; line-height: 1.7; color: #555;">
                                     <i class="bi bi-check-circle-fill text-success me-2"></i>
-                                    <strong>说明</strong>：${intro}
+                                    <strong>说明</strong>：${escapeHtml(intro)}
                                 </div>
                             </div>
                         </div>
