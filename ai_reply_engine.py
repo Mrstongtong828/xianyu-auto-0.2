@@ -380,7 +380,7 @@ class AIReplyEngine:
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
         """检查指定账号是否启用AI回复"""
-        settings = db_manager.get_ai_reply_settings(cookie_id)
+        settings = db_manager.get_effective_ai_reply_settings(cookie_id)
         return settings['ai_enabled']
     
     def _get_chat_lock(self, chat_id: str) -> threading.Lock:
@@ -428,7 +428,7 @@ class AIReplyEngine:
                         return None
                 
                 # 1. 获取AI设置
-                settings = db_manager.get_ai_reply_settings(cookie_id)
+                settings = db_manager.get_effective_ai_reply_settings(cookie_id)
                 custom_prompts = json.loads(settings['custom_prompts']) if settings['custom_prompts'] else {}
 
                 # 2. 获取对话历史

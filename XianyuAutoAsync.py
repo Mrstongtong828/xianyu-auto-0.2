@@ -2113,6 +2113,9 @@ class XianyuLive:
         self.pending_message_expire_time = 300  # 消息处理中保留时间（秒），避免处理中途异常导致永久卡死
 
         # 订单详情补抓任务：详情首次超时时，后台再补抓一次，避免整单丢失
+        self.semantic_buyer_message_window_seconds = 30
+        self.recent_buyer_message_semantic_keys = {}
+        self.recent_buyer_message_semantic_lock = asyncio.Lock()
         self.order_detail_retry_tasks = {}
         self.order_detail_force_refresh_marks = {}
         self.order_detail_force_refresh_cooldown = 5
@@ -14736,6 +14739,69 @@ class XianyuLive:
         if released is not None:
             logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已释放预占，允许重试: {reason or 'unknown'}")
 
+    async def _select_auto_reply(self, send_user_name: str, send_user_id: str, send_message: str,
+                                 chat_id: str, item_id: str, msg_time: str = ""):
+        reply = await self.get_item_specific_reply(send_user_name, send_user_id, send_message, item_id)
+        if reply:
+            return reply, '指定商品', False
+
+        reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
+        if reply == "EMPTY_REPLY":
+            logger.info(f"[{msg_time}] 【{self.cookie_id}】匹配到空回复关键词，跳过自动回复")
+            return None, '关键词', True
+        if reply:
+            return reply, '关键词', False
+
+        reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+        if reply:
+            return reply, 'AI', False
+
+        reply = await self.get_default_reply(send_user_name, send_user_id, send_message, chat_id, item_id)
+        if reply == "EMPTY_REPLY":
+            logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复内容为空，跳过自动回复")
+            return None, '默认', True
+        if reply == "SKIP_REPLY":
+            logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复已命中过当前会话，跳过自动回复")
+            return None, '默认', True
+        if reply:
+            return reply, '默认', False
+
+        return None, None, False
+
+    async def _reserve_recent_buyer_message_semantic(self, chat_id: str, send_user_id: str,
+                                                     send_message: str, content_type, item_id: str = None,
+                                                     now: float = None):
+        now = time.time() if now is None else float(now)
+        window = getattr(self, 'semantic_buyer_message_window_seconds', 30) or 30
+        normalized_message = ' '.join(str(send_message or '').split())
+        semantic_key = '|'.join([
+            str(chat_id or ''),
+            str(send_user_id or ''),
+            str(item_id or ''),
+            str(content_type if content_type is not None else ''),
+            normalized_message,
+        ])
+
+        if not hasattr(self, 'recent_buyer_message_semantic_keys'):
+            self.recent_buyer_message_semantic_keys = {}
+        if not hasattr(self, 'recent_buyer_message_semantic_lock'):
+            self.recent_buyer_message_semantic_lock = asyncio.Lock()
+
+        async with self.recent_buyer_message_semantic_lock:
+            expired_keys = [
+                key for key, timestamp in self.recent_buyer_message_semantic_keys.items()
+                if now - timestamp > window
+            ]
+            for key in expired_keys:
+                del self.recent_buyer_message_semantic_keys[key]
+
+            last_seen = self.recent_buyer_message_semantic_keys.get(semantic_key)
+            if last_seen is not None and now - last_seen <= window:
+                return True, semantic_key
+
+            self.recent_buyer_message_semantic_keys[semantic_key] = now
+            return False, semantic_key
+
     async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
                                        item_id: str, msg_time: str, dedupe_message_id: str = None,
@@ -14903,39 +14969,16 @@ class XianyuLive:
             if blacklist_hit:
                 return
 
-            reply = None
-            reply_source = None
-
-            # 按 README 定义的优先级处理：
-            # 指定商品回复 > 商品专用关键词 > 通用关键词 > 默认回复 > AI回复
-            reply = await self.get_item_specific_reply(send_user_name, send_user_id, send_message, item_id)
-            if reply:
-                reply_source = '指定商品'
-            else:
-                # 1. 尝试关键词匹配（内部已区分商品专用关键词和通用关键词）
-                reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
-                if reply == "EMPTY_REPLY":
-                    # 匹配到关键词但回复内容为空，不进行任何回复
-                    logger.info(f"[{msg_time}] 【{self.cookie_id}】匹配到空回复关键词，跳过自动回复")
-                    return
-                elif reply:
-                    reply_source = '关键词'  # 标记为关键词回复
-                else:
-                    # 2. 关键词匹配失败后，使用默认回复兜底
-                    reply = await self.get_default_reply(send_user_name, send_user_id, send_message, chat_id, item_id)
-                    if reply == "EMPTY_REPLY":
-                        logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复内容为空，跳过自动回复")
-                        return
-                    elif reply == "SKIP_REPLY":
-                        logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复已命中过当前会话，跳过自动回复")
-                        return
-                    elif reply:
-                        reply_source = '默认'
-                    else:
-                        # 3. 最后尝试AI回复
-                        reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
-                        if reply:
-                            reply_source = 'AI'
+            reply, reply_source, should_stop = await self._select_auto_reply(
+                send_user_name=send_user_name,
+                send_user_id=send_user_id,
+                send_message=send_message,
+                chat_id=chat_id,
+                item_id=item_id,
+                msg_time=msg_time,
+            )
+            if should_stop:
+                return
 
             # 注意：这里只有商品ID，没有标题和详情，根据新的规则不保存到数据库
             # 商品信息会在其他有完整信息的地方保存（如发货规则匹配时）
@@ -16085,6 +16128,19 @@ class XianyuLive:
                 logger.info(
                     f"【{self.cookie_id}】[{msg_id}] ⏹️ 当前消息不进入自动回复链: "
                     f"route={message_route}, status_signal={order_status_signal or 'none'}"
+                )
+                return
+
+            is_duplicate_semantic_message, semantic_message_key = await self._reserve_recent_buyer_message_semantic(
+                chat_id=chat_id,
+                send_user_id=send_user_id,
+                send_message=send_message,
+                content_type=content_type,
+                item_id=item_id,
+            )
+            if is_duplicate_semantic_message:
+                logger.info(
+                    f"【{self.cookie_id}】[{msg_id}] 跳过重复买家消息自动回复: key={semantic_message_key}"
                 )
                 return
 

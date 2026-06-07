@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 import base64
+import socket
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -1412,6 +1413,15 @@ async def register_page():
 
 
 # 管理页面（不需要服务器端认证，由前端JavaScript处理）
+@app.get('/notification-channel-setup', response_class=HTMLResponse, name='notification_channel_setup_page')
+async def notification_channel_setup_page():
+    setup_path = os.path.join(static_dir, 'notification-channel-setup.html')
+    if os.path.exists(setup_path):
+        with open(setup_path, 'r', encoding='utf-8') as f:
+            return HTMLResponse(f.read())
+    return HTMLResponse('<h3>Notification setup page not found</h3>', status_code=404)
+
+
 @app.get('/admin', response_class=HTMLResponse)
 async def admin_page():
     index_path = os.path.join(static_dir, 'index.html')
@@ -2739,6 +2749,14 @@ class NotificationChannelUpdate(BaseModel):
     name: str
     config: str
     enabled: bool = True
+
+
+class NotificationSetupChannelIn(BaseModel):
+    token: str
+    type: str = "qq"
+    name: str
+    config: Any = ""
+    send_test: bool = False
 
 
 class MessageNotificationIn(BaseModel):
@@ -7316,6 +7334,123 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _hash_notification_setup_token(token: str) -> str:
+    return hashlib.sha256(str(token or '').encode('utf-8')).hexdigest()
+
+
+def _get_lan_access_base_url(request: Request) -> str:
+    configured = (os.environ.get('NOTIFICATION_SETUP_PUBLIC_BASE_URL') or '').strip().rstrip('/')
+    if configured:
+        return configured
+
+    scheme = request.headers.get('X-Forwarded-Proto') or request.url.scheme or 'http'
+    host_header = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.url.netloc
+    host_header = str(host_header or '').strip()
+    host_only = host_header.split(':', 1)[0].lower()
+    local_hosts = {'localhost', '127.0.0.1', '0.0.0.0', '::1'}
+
+    if host_only in local_hosts:
+        port = ''
+        if ':' in host_header and not host_header.startswith('['):
+            port = ':' + host_header.rsplit(':', 1)[-1]
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(('8.8.8.8', 80))
+            host_only = probe.getsockname()[0]
+        except Exception:
+            try:
+                host_only = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                host_only = '127.0.0.1'
+        finally:
+            if probe is not None:
+                probe.close()
+        return f"{scheme}://{host_only}{port}".rstrip('/')
+
+    return f"{scheme}://{host_header}".rstrip('/')
+
+
+@app.post('/notification-channel-setup/sessions')
+def create_notification_channel_setup_session(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """生成一次性通知渠道扫码配置链接"""
+    from db_manager import db_manager
+    try:
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + 10 * 60
+        db_manager.create_notification_setup_session(
+            _hash_notification_setup_token(token),
+            current_user['user_id'],
+            expires_at
+        )
+        base_url = _get_lan_access_base_url(request)
+        setup_url = f"{base_url}/notification-channel-setup?token={token}"
+        return {"token": token, "setup_url": setup_url, "expires_at": expires_at, "public_base_url": base_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/api/notification-channel-setup/{token}')
+def get_notification_channel_setup_session(token: str):
+    """校验一次性通知渠道配置 token"""
+    from db_manager import db_manager
+    session = db_manager.get_notification_setup_session(_hash_notification_setup_token(token))
+    if not session:
+        raise HTTPException(status_code=404, detail='配置链接不存在')
+    if session.get('used_at'):
+        raise HTTPException(status_code=410, detail='配置链接已使用')
+    if float(session.get('expires_at') or 0) <= time.time():
+        raise HTTPException(status_code=410, detail='配置链接已过期')
+    return {
+        "valid": True,
+        "expires_at": session.get('expires_at'),
+        "supported_types": ["qq", "feishu", "dingtalk", "webhook"]
+    }
+
+
+@app.post('/api/notification-channel-setup')
+def save_notification_channel_setup(channel_data: NotificationSetupChannelIn):
+    """消费一次性 token 并创建通知渠道"""
+    from db_manager import db_manager
+    token_hash = _hash_notification_setup_token(channel_data.token)
+    session = db_manager.get_notification_setup_session(token_hash)
+    if not session:
+        raise HTTPException(status_code=404, detail='配置链接不存在')
+    if session.get('used_at'):
+        raise HTTPException(status_code=410, detail='配置链接已使用')
+    if float(session.get('expires_at') or 0) <= time.time():
+        raise HTTPException(status_code=410, detail='配置链接已过期')
+
+    config_value = channel_data.config
+    if isinstance(config_value, (dict, list)):
+        config_value = json.dumps(config_value, ensure_ascii=False)
+    else:
+        config_value = str(config_value or '')
+
+    try:
+        channel_id = db_manager.create_notification_channel(
+            channel_data.name,
+            channel_data.type,
+            config_value,
+            session['user_id']
+        )
+        consumed_id = db_manager.consume_notification_setup_session(token_hash, channel_id=channel_id)
+        if not consumed_id:
+            raise HTTPException(status_code=409, detail='配置链接已失效')
+        return {
+            "success": True,
+            "channel_id": channel_id,
+            "test_sent": False if channel_data.send_test else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get('/notification-channels/{channel_id}')
 def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定通知渠道"""
@@ -10816,6 +10951,11 @@ class AIConfigPreset(BaseModel):
     api_key: str = ""
     base_url: str = ""
     api_type: str = ""
+    max_discount_percent: float = 0
+    max_discount_amount: float = 0
+    max_bargain_rounds: int = 0
+    custom_prompts: str = ""
+    bound_account_ids: List[str] = []
 
 
 @app.delete("/items/batch")
@@ -10956,13 +11096,51 @@ def save_ai_config_preset(
             model_name=preset.model_name,
             api_key=preset.api_key,
             base_url=preset.base_url,
-            api_type=preset.api_type
+            api_type=preset.api_type,
+            max_discount_percent=preset.max_discount_percent,
+            max_discount_amount=preset.max_discount_amount,
+            max_bargain_rounds=preset.max_bargain_rounds,
+            custom_prompts=preset.custom_prompts
         )
-        return {"message": "预设保存成功", "preset_id": preset_id}
+        bound_account_ids = list(preset.bound_account_ids or [])
+        if bound_account_ids:
+            if not db_manager.bind_ai_config_preset_accounts(user_id, preset_id, bound_account_ids):
+                raise HTTPException(status_code=400, detail="绑定账号失败，请确认账号属于当前用户")
+            bound_account_ids = db_manager.get_ai_config_preset_bindings(user_id, preset_id)
+
+        return {"message": "预设保存成功", "preset_id": preset_id, "bound_account_ids": bound_account_ids}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"保存AI配置预设异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.put("/ai-config-presets/{preset_id}/bindings")
+def update_ai_config_preset_bindings(
+    preset_id: int,
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """更新AI配置预设绑定账号"""
+    try:
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        account_ids = payload.get('account_ids') or []
+        if not isinstance(account_ids, list):
+            raise HTTPException(status_code=400, detail="account_ids 必须是数组")
+
+        if not db_manager.bind_ai_config_preset_accounts(user_id, preset_id, account_ids):
+            raise HTTPException(status_code=400, detail="绑定账号失败，请确认预设和账号属于当前用户")
+
+        return {
+            "success": True,
+            "bound_account_ids": db_manager.get_ai_config_preset_bindings(user_id, preset_id)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新AI配置预设绑定异常: {e}")
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 

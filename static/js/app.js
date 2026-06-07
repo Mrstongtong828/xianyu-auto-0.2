@@ -6558,16 +6558,15 @@ function toggleAIReplySettings() {
     const promptSettings = document.getElementById('promptSettings');
     const testArea = document.getElementById('testArea');
 
-    if (enabled) {
     settingsDiv.style.display = 'block';
-    bargainSettings.style.display = 'block';
-    promptSettings.style.display = 'block';
-    testArea.style.display = 'block';
+    if (enabled) {
+        bargainSettings.style.display = 'block';
+        promptSettings.style.display = 'block';
+        testArea.style.display = 'block';
     } else {
-    settingsDiv.style.display = 'none';
-    bargainSettings.style.display = 'none';
-    promptSettings.style.display = 'none';
-    testArea.style.display = 'none';
+        bargainSettings.style.display = 'none';
+        promptSettings.style.display = 'none';
+        testArea.style.display = 'none';
     }
 }
 
@@ -6719,9 +6718,56 @@ function toggleCustomModelInput() {
 // -------------------- AI配置预设功能 --------------------
 
 let _aiPresets = []; // 缓存预设数据，避免依赖 option dataset
+let _aiPresetAccounts = [];
+
+async function ensureAIPresetAccountBindingPanel() {
+    const select = document.getElementById('aiPresetSelect');
+    if (!select || document.getElementById('aiPresetAccountBindings')) return;
+    const panel = document.createElement('div');
+    panel.id = 'aiPresetAccountBindings';
+    panel.className = 'mt-3 p-3 border rounded bg-light';
+    panel.innerHTML = '<div class="fw-semibold mb-1"><i class="bi bi-people me-1"></i>模型组绑定账号</div><div class="small text-muted mb-2">勾选后，保存当前预设时会把这些账号绑定到同一个共享模型组。</div><div id="aiPresetAccountBindingList" class="small text-muted">正在加载账号...</div>';
+    const host = select.closest('.input-group') || select.parentElement;
+    host.insertAdjacentElement('afterend', panel);
+}
+
+async function loadAIPresetAccounts() {
+    try {
+        _aiPresetAccounts = await fetchJSON(`${apiBase}/cookies/details`) || [];
+    } catch (e) {
+        console.error('加载AI预设账号列表失败:', e);
+        _aiPresetAccounts = [];
+    }
+}
+
+function renderAIPresetAccountBindings(boundIds = []) {
+    const list = document.getElementById('aiPresetAccountBindingList');
+    if (!list) return;
+    const boundSet = new Set((boundIds || []).map(String));
+    if (!_aiPresetAccounts.length) {
+        list.innerHTML = '<span class="text-muted">暂无可绑定账号</span>';
+        return;
+    }
+    list.innerHTML = _aiPresetAccounts.map(account => {
+        const id = String(account.id || '');
+        const label = account.remark || account.username || id;
+        return `
+            <label class="form-check form-check-inline mb-1">
+                <input class="form-check-input ai-preset-bound-account" type="checkbox" value="${escapeHtml(id)}" ${boundSet.has(id) ? 'checked' : ''}>
+                <span class="form-check-label">${escapeHtml(label)} <span class="text-muted">(${escapeHtml(id)})</span></span>
+            </label>
+        `;
+    }).join('');
+}
+
+function getSelectedAIPresetBoundAccountIds() {
+    return Array.from(document.querySelectorAll('.ai-preset-bound-account:checked')).map(input => input.value);
+}
 
 async function loadAIPresets() {
     try {
+        await ensureAIPresetAccountBindingPanel();
+        await loadAIPresetAccounts();
         const presets = await fetchJSON(`${apiBase}/ai-config-presets`);
         _aiPresets = presets || [];
         const select = document.getElementById('aiPresetSelect');
@@ -6730,11 +6776,13 @@ async function loadAIPresets() {
         _aiPresets.forEach(p => {
             const opt = document.createElement('option');
             opt.value = p.id;
-            opt.textContent = p.preset_name;
+            opt.textContent = `${p.preset_name}${p.bound_account_count ? `（已绑定${p.bound_account_count}个账号）` : ''}`;
             select.appendChild(opt);
         });
         // 尝试自动匹配当前表单值对应的预设
         _autoSelectMatchingPreset();
+        const selected = _aiPresets.find(p => String(p.id) === String(select.value));
+        renderAIPresetAccountBindings(selected ? selected.bound_account_ids : []);
         deleteBtn.style.display = select.value ? '' : 'none';
     } catch (e) {
         console.error('加载AI配置预设失败:', e);
@@ -6764,6 +6812,7 @@ function loadAIPreset() {
 
     if (!presetId) {
         deleteBtn.style.display = 'none';
+        renderAIPresetAccountBindings([]);
         return;
     }
     deleteBtn.style.display = '';
@@ -6789,6 +6838,26 @@ function loadAIPreset() {
     document.getElementById('aiApiKey').value = preset.api_key;
     const normalizedPresetApiType = preset.api_type === 'dashscope' ? '' : (preset.api_type || '');
     document.getElementById('aiApiType').value = normalizedPresetApiType;
+    if (preset.max_discount_percent !== undefined) {
+        document.getElementById('maxDiscountPercent').value = preset.max_discount_percent;
+    }
+    if (preset.max_discount_amount !== undefined) {
+        document.getElementById('maxDiscountAmount').value = preset.max_discount_amount;
+    }
+    if (preset.max_bargain_rounds !== undefined) {
+        document.getElementById('maxBargainRounds').value = preset.max_bargain_rounds;
+    }
+    if (preset.custom_prompts) {
+        try {
+            const prompts = JSON.parse(preset.custom_prompts);
+            document.getElementById('promptPrice').value = prompts.price || '';
+            document.getElementById('promptTech').value = prompts.tech || '';
+            document.getElementById('promptDefault').value = prompts.default || '';
+        } catch (e) {
+            console.warn('解析预设提示词失败:', e);
+        }
+    }
+    renderAIPresetAccountBindings(preset.bound_account_ids || []);
     updateApiUrlPreview();
 
     showToast(`已切换到预设「${preset.preset_name}」`, 'success');
@@ -6803,6 +6872,11 @@ async function saveCurrentAsPreset() {
     const modelName = modelSelect.value === 'custom' ? customModelInput.value : modelSelect.value;
     const apiKey = document.getElementById('aiApiKey').value;
     const baseUrl = document.getElementById('aiBaseUrl').value;
+    const customPrompts = {
+        price: document.getElementById('promptPrice')?.value || '',
+        tech: document.getElementById('promptTech')?.value || '',
+        default: document.getElementById('promptDefault')?.value || ''
+    };
 
     if (!modelName) {
         showToast('请先选择或输入模型名称', 'warning');
@@ -6818,7 +6892,12 @@ async function saveCurrentAsPreset() {
                 model_name: modelName,
                 api_key: apiKey,
                 base_url: baseUrl,
-                api_type: document.getElementById('aiApiType').value
+                api_type: document.getElementById('aiApiType').value,
+                max_discount_percent: Number(document.getElementById('maxDiscountPercent')?.value || 0),
+                max_discount_amount: Number(document.getElementById('maxDiscountAmount')?.value || 0),
+                max_bargain_rounds: Number(document.getElementById('maxBargainRounds')?.value || 0),
+                custom_prompts: JSON.stringify(customPrompts),
+                bound_account_ids: getSelectedAIPresetBoundAccountIds()
             })
         });
         showToast('预设保存成功', 'success');
@@ -7321,6 +7400,74 @@ async function saveNotificationChannel() {
 }
 
 // 加载通知渠道列表
+async function showNotificationChannelSetupQr() {
+    try {
+        const response = await fetch(`${apiBase}/notification-channel-setup/sessions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data.detail || '生成扫码配置链接失败');
+        }
+        const expiresAt = data.expires_at
+            ? new Date(Number(data.expires_at) * 1000).toLocaleString('zh-CN')
+            : '10分钟后';
+        const setupUrl = data.setup_url || '';
+        let modalEl = document.getElementById('notificationSetupQrModal');
+        if (!modalEl) {
+            modalEl = document.createElement('div');
+            modalEl.className = 'modal fade';
+            modalEl.id = 'notificationSetupQrModal';
+            modalEl.tabIndex = -1;
+            modalEl.innerHTML = `
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">扫码配置通知渠道</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                        </div>
+                        <div class="modal-body text-center">
+                            <div id="notificationSetupQrImage" class="mb-3"></div>
+                            <div class="small text-muted mb-2" id="notificationSetupQrExpires"></div>
+                            <input id="notificationSetupQrUrl" class="form-control form-control-sm" readonly>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-outline-secondary" onclick="copyNotificationSetupUrl()">复制链接</button>
+                            <button type="button" class="btn btn-primary" data-bs-dismiss="modal">知道了</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modalEl);
+        }
+        document.getElementById('notificationSetupQrImage').innerHTML =
+            `<img alt="扫码配置通知渠道" class="img-fluid border rounded p-2 bg-white" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(setupUrl)}">`;
+        document.getElementById('notificationSetupQrExpires').textContent = `链接有效期至：${expiresAt}`;
+        document.getElementById('notificationSetupQrUrl').value = setupUrl;
+        new bootstrap.Modal(modalEl).show();
+    } catch (error) {
+        console.error('生成通知渠道扫码配置失败:', error);
+        showToast(error.message || '生成扫码配置链接失败', 'danger');
+    }
+}
+
+async function copyNotificationSetupUrl() {
+    const input = document.getElementById('notificationSetupQrUrl');
+    const value = input ? input.value : '';
+    if (!value) return;
+    try {
+        await navigator.clipboard.writeText(value);
+        showToast('配置链接已复制', 'success');
+    } catch (error) {
+        input.select();
+        document.execCommand('copy');
+        showToast('配置链接已复制', 'success');
+    }
+}
+
 async function loadNotificationChannels() {
     try {
     const response = await fetch(`${apiBase}/notification-channels`, {
@@ -7344,6 +7491,17 @@ async function loadNotificationChannels() {
 // 渲染通知渠道列表
 function renderNotificationChannels(channels) {
     const tbody = document.getElementById('channelsTableBody');
+    const table = tbody ? tbody.closest('table') : null;
+    if (table && !document.getElementById('notificationSetupQrBtn')) {
+        const toolbar = document.createElement('div');
+        toolbar.className = 'd-flex justify-content-end mb-3';
+        toolbar.innerHTML = `
+            <button id="notificationSetupQrBtn" class="btn btn-outline-success btn-sm" onclick="showNotificationChannelSetupQr()">
+                <i class="bi bi-qr-code me-1"></i>扫码配置
+            </button>
+        `;
+        table.parentElement.insertBefore(toolbar, table);
+    }
     tbody.innerHTML = '';
 
     if (channels.length === 0) {

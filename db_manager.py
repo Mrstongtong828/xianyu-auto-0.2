@@ -425,10 +425,44 @@ class DBManager:
                 api_key TEXT NOT NULL DEFAULT '',
                 base_url TEXT NOT NULL DEFAULT '',
                 api_type TEXT NOT NULL DEFAULT '',
+                max_discount_percent REAL DEFAULT 0,
+                max_discount_amount REAL DEFAULT 0,
+                max_bargain_rounds INTEGER DEFAULT 3,
+                custom_prompts TEXT DEFAULT '{}',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 UNIQUE(user_id, preset_name)
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_config_preset_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                preset_id INTEGER NOT NULL,
+                cookie_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (preset_id) REFERENCES ai_config_presets(id) ON DELETE CASCADE,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
+                UNIQUE(user_id, cookie_id)
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notification_setup_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                used_at REAL,
+                channel_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE SET NULL
             )
             ''')
 
@@ -1094,7 +1128,54 @@ Cookie数量: {cookie_count}
                 cursor.execute("ALTER TABLE ai_config_presets ADD COLUMN api_type TEXT NOT NULL DEFAULT ''")
                 logger.info("数据库迁移完成：添加ai_config_presets.api_type列")
 
-            # 检查risk_control_logs表扩展字段
+            cursor.execute("PRAGMA table_info(ai_config_presets)")
+            preset_columns = [column[1] for column in cursor.fetchall()]
+            ai_preset_column_defs = {
+                'max_discount_percent': 'REAL DEFAULT 0',
+                'max_discount_amount': 'REAL DEFAULT 0',
+                'max_bargain_rounds': 'INTEGER DEFAULT 3',
+                'custom_prompts': "TEXT DEFAULT '{}'",
+            }
+            for column_name, column_def in ai_preset_column_defs.items():
+                if column_name not in preset_columns:
+                    logger.info(f"添加ai_config_presets表的{column_name}列...")
+                    cursor.execute(f"ALTER TABLE ai_config_presets ADD COLUMN {column_name} {column_def}")
+                    logger.info(f"数据库迁移完成：添加ai_config_presets.{column_name}列")
+
+            self._execute_sql(cursor, '''
+            CREATE TABLE IF NOT EXISTS ai_config_preset_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                preset_id INTEGER NOT NULL,
+                cookie_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (preset_id) REFERENCES ai_config_presets(id) ON DELETE CASCADE,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
+                UNIQUE(user_id, cookie_id)
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_ai_preset_bindings_preset ON ai_config_preset_bindings(user_id, preset_id)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_ai_preset_bindings_cookie ON ai_config_preset_bindings(cookie_id)")
+
+            self._execute_sql(cursor, '''
+            CREATE TABLE IF NOT EXISTS notification_setup_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                used_at REAL,
+                channel_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE SET NULL
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_notification_setup_sessions_token ON notification_setup_sessions(token_hash)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_notification_setup_sessions_user ON notification_setup_sessions(user_id, expires_at)")
+
             cursor.execute("PRAGMA table_info(risk_control_logs)")
             risk_log_columns = [column[1] for column in cursor.fetchall()]
             risk_log_column_defs = {
@@ -3341,23 +3422,51 @@ Cookie数量: {cookie_count}
                 return {}
 
     # -------------------- AI配置预设操作 --------------------
-    def save_ai_config_preset(self, user_id: int, preset_name: str, model_name: str, api_key: str = '', base_url: str = '', api_type: str = '') -> int:
+    def save_ai_config_preset(
+        self,
+        user_id: int,
+        preset_name: str,
+        model_name: str,
+        api_key: str = '',
+        base_url: str = '',
+        api_type: str = '',
+        max_discount_percent: float = 0,
+        max_discount_amount: float = 0,
+        max_bargain_rounds: int = 3,
+        custom_prompts: str = '{}',
+    ) -> int:
         """保存AI配置预设（存在则更新）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO ai_config_presets (user_id, preset_name, model_name, api_key, base_url, api_type, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO ai_config_presets (
+                    user_id, preset_name, model_name, api_key, base_url, api_type,
+                    max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id, preset_name) DO UPDATE SET
                     model_name = excluded.model_name,
                     api_key = excluded.api_key,
                     base_url = excluded.base_url,
                     api_type = excluded.api_type,
+                    max_discount_percent = excluded.max_discount_percent,
+                    max_discount_amount = excluded.max_discount_amount,
+                    max_bargain_rounds = excluded.max_bargain_rounds,
+                    custom_prompts = excluded.custom_prompts,
                     updated_at = CURRENT_TIMESTAMP
-                ''', (user_id, preset_name, model_name, api_key, base_url, api_type))
+                ''', (
+                    user_id, preset_name, model_name, api_key, base_url, api_type,
+                    max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts,
+                ))
+                cursor.execute(
+                    "SELECT id FROM ai_config_presets WHERE user_id = ? AND preset_name = ?",
+                    (user_id, preset_name),
+                )
+                row = cursor.fetchone()
                 self.conn.commit()
-                preset_id = cursor.lastrowid
+                preset_id = row[0] if row else cursor.lastrowid
                 logger.debug(f"保存AI配置预设: user_id={user_id}, preset_name={preset_name}")
                 return preset_id
             except Exception as e:
@@ -3370,13 +3479,16 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, preset_name, model_name, api_key, base_url, api_type, created_at, updated_at
+                SELECT id, preset_name, model_name, api_key, base_url, api_type,
+                       max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts,
+                       created_at, updated_at
                 FROM ai_config_presets
                 WHERE user_id = ?
                 ORDER BY updated_at DESC
                 ''', (user_id,))
                 presets = []
                 for row in cursor.fetchall():
+                    bindings = self.get_ai_config_preset_bindings(user_id, row[0])
                     presets.append({
                         'id': row[0],
                         'preset_name': row[1],
@@ -3384,8 +3496,14 @@ Cookie数量: {cookie_count}
                         'api_key': row[3],
                         'base_url': row[4],
                         'api_type': row[5] or '',
-                        'created_at': row[6],
-                        'updated_at': row[7]
+                        'max_discount_percent': row[6],
+                        'max_discount_amount': row[7],
+                        'max_bargain_rounds': row[8],
+                        'custom_prompts': row[9],
+                        'created_at': row[10],
+                        'updated_at': row[11],
+                        'bound_account_ids': bindings,
+                        'bound_account_count': len(bindings)
                     })
                 return presets
             except Exception as e:
@@ -3397,6 +3515,9 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                cursor.execute('''
+                DELETE FROM ai_config_preset_bindings WHERE preset_id = ? AND user_id = ?
+                ''', (preset_id, user_id))
                 cursor.execute('''
                 DELETE FROM ai_config_presets WHERE id = ? AND user_id = ?
                 ''', (preset_id, user_id))
@@ -3410,6 +3531,111 @@ Cookie数量: {cookie_count}
                 return False
 
     # -------------------- 默认回复操作 --------------------
+    def bind_ai_config_preset_accounts(self, user_id: int, preset_id: int, account_ids: list) -> bool:
+        normalized_ids = []
+        for account_id in account_ids or []:
+            account_id = str(account_id or '').strip()
+            if account_id and account_id not in normalized_ids:
+                normalized_ids.append(account_id)
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT id FROM ai_config_presets WHERE id = ? AND user_id = ?", (preset_id, user_id))
+                if not cursor.fetchone():
+                    return False
+
+                owned_ids = set()
+                if normalized_ids:
+                    placeholders = ','.join('?' for _ in normalized_ids)
+                    cursor.execute(
+                        f"SELECT id FROM cookies WHERE user_id = ? AND id IN ({placeholders})",
+                        (user_id, *normalized_ids),
+                    )
+                    owned_ids = {row[0] for row in cursor.fetchall()}
+
+                cursor.execute(
+                    "DELETE FROM ai_config_preset_bindings WHERE user_id = ? AND preset_id = ?",
+                    (user_id, preset_id),
+                )
+                for account_id in normalized_ids:
+                    if account_id not in owned_ids:
+                        continue
+                    cursor.execute(
+                        '''
+                        INSERT INTO ai_config_preset_bindings (user_id, preset_id, cookie_id, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id, cookie_id) DO UPDATE SET
+                            preset_id = excluded.preset_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (user_id, preset_id, account_id),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"绑定AI配置预设账号失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_ai_config_preset_bindings(self, user_id: int, preset_id: int) -> list:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT cookie_id FROM ai_config_preset_bindings
+                    WHERE user_id = ? AND preset_id = ?
+                    ORDER BY cookie_id
+                    ''',
+                    (user_id, preset_id),
+                )
+                return [row[0] for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取AI配置预设绑定失败: {e}")
+                return []
+
+    def get_effective_ai_reply_settings(self, cookie_id: str) -> dict:
+        account_settings = self.get_ai_reply_settings(cookie_id) or {}
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT p.id, p.preset_name, p.model_name, p.api_key, p.base_url, p.api_type,
+                           p.max_discount_percent, p.max_discount_amount, p.max_bargain_rounds, p.custom_prompts
+                    FROM ai_config_preset_bindings b
+                    JOIN ai_config_presets p ON p.id = b.preset_id AND p.user_id = b.user_id
+                    WHERE b.cookie_id = ?
+                    LIMIT 1
+                    ''',
+                    (cookie_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    account_settings['source'] = 'account'
+                    return account_settings
+
+                effective = dict(account_settings)
+                effective.update({
+                    'source': 'preset',
+                    'preset_id': row[0],
+                    'preset_name': row[1],
+                    'model_name': row[2],
+                    'api_key': row[3],
+                    'base_url': row[4],
+                    'api_type': row[5] or '',
+                    'max_discount_percent': row[6],
+                    'max_discount_amount': row[7],
+                    'max_bargain_rounds': row[8],
+                    'custom_prompts': row[9],
+                })
+                return effective
+            except Exception as e:
+                logger.error(f"获取有效AI回复设置失败: {e}")
+                account_settings['source'] = 'account'
+                return account_settings
+
     def save_default_reply(self, cookie_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False):
         """保存默认回复设置"""
         with self.lock:
@@ -3521,6 +3747,90 @@ Cookie数量: {cookie_count}
                 return False
 
     # -------------------- 通知渠道操作 --------------------
+    def create_notification_setup_session(self, token_hash: str, user_id: int, expires_at: float) -> Dict[str, any]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO notification_setup_sessions (token_hash, user_id, expires_at)
+                    VALUES (?, ?, ?)
+                    ''',
+                    (token_hash, user_id, expires_at),
+                )
+                self.conn.commit()
+                session_id = cursor.lastrowid
+                return {
+                    'id': session_id,
+                    'token_hash': token_hash,
+                    'user_id': user_id,
+                    'expires_at': expires_at,
+                    'used_at': None,
+                    'channel_id': None,
+                }
+            except Exception as e:
+                logger.error(f"创建通知扫码配置会话失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def get_notification_setup_session(self, token_hash: str) -> Optional[Dict[str, any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT id, token_hash, user_id, expires_at, used_at, channel_id
+                    FROM notification_setup_sessions
+                    WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+                    ''',
+                    (token_hash, time.time()),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'id': row[0],
+                    'token_hash': row[1],
+                    'user_id': row[2],
+                    'expires_at': row[3],
+                    'used_at': row[4],
+                    'channel_id': row[5],
+                }
+            except Exception as e:
+                logger.error(f"获取通知扫码配置会话失败: {e}")
+                return None
+
+    def consume_notification_setup_session(self, token_hash: str, channel_id: int = None) -> Optional[int]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                now = time.time()
+                cursor.execute(
+                    '''
+                    SELECT id FROM notification_setup_sessions
+                    WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+                    ''',
+                    (token_hash, now),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                session_id = row[0]
+                cursor.execute(
+                    '''
+                    UPDATE notification_setup_sessions
+                    SET used_at = ?, channel_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''',
+                    (now, channel_id, session_id),
+                )
+                self.conn.commit()
+                return session_id
+            except Exception as e:
+                logger.error(f"消费通知扫码配置会话失败: {e}")
+                self.conn.rollback()
+                return None
+
     def create_notification_channel(self, name: str, channel_type: str, config: str, user_id: int = None) -> int:
         """创建通知渠道"""
         with self.lock:
