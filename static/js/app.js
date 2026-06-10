@@ -1089,6 +1089,158 @@ function getDashboardHealthLevelMeta(level) {
     return { text: '正常', className: 'success', icon: 'check-circle' };
 }
 
+function getDashboardIssuePriorityMeta(priority) {
+    const normalized = String(priority || '').toLowerCase();
+    if (normalized === 'high') {
+        return { text: '高', className: 'danger' };
+    }
+    if (normalized === 'medium') {
+        return { text: '中', className: 'warning text-dark' };
+    }
+    return { text: '低', className: 'secondary' };
+}
+
+function getDashboardIssueKey(item) {
+    return [
+        item?.type || 'issue',
+        item?.cookie_id || '',
+        item?.source_id || ''
+    ].join(':');
+}
+
+function getDashboardIssueCenterIgnoredKeys() {
+    try {
+        const stored = sessionStorage.getItem('dashboardIssueCenterIgnored');
+        const parsed = stored ? JSON.parse(stored) : [];
+        return new Set(Array.isArray(parsed) ? parsed.map(key => String(key || '')) : []);
+    } catch (error) {
+        sessionStorage.removeItem('dashboardIssueCenterIgnored');
+        return new Set();
+    }
+}
+
+function saveDashboardIssueCenterIgnoredKeys(ignoredKeys) {
+    sessionStorage.setItem(
+        'dashboardIssueCenterIgnored',
+        JSON.stringify(Array.from(ignoredKeys).slice(-100))
+    );
+}
+
+function bindDashboardIssueCenterActions() {
+    const body = document.getElementById('dashboardIssueCenterBody');
+    if (!body) {
+        return;
+    }
+
+    body.querySelectorAll('[data-dashboard-issue-action]').forEach(button => {
+        button.addEventListener('click', () => {
+            handleDashboardIssueAction(
+                button.dataset.dashboardIssueAction || '',
+                button.dataset.cookieId || ''
+            );
+        });
+    });
+
+    body.querySelectorAll('[data-dashboard-issue-ignore]').forEach(button => {
+        button.addEventListener('click', () => {
+            ignoreDashboardIssueOnce(button.dataset.issueKey || '');
+        });
+    });
+}
+
+function renderDashboardIssueCenter(actionItems) {
+    const panel = document.getElementById('dashboardIssueCenter');
+    const body = document.getElementById('dashboardIssueCenterBody');
+    const countEl = document.getElementById('dashboardIssueCenterCount');
+    if (!panel || !body) {
+        return;
+    }
+
+    const items = Array.isArray(actionItems?.items) ? actionItems.items : [];
+    const ignoredKeys = getDashboardIssueCenterIgnoredKeys();
+    const visibleItems = items.filter(item => !ignoredKeys.has(getDashboardIssueKey(item)));
+
+    if (!visibleItems.length) {
+        panel.style.display = 'none';
+        body.innerHTML = '';
+        if (countEl) countEl.textContent = '0 项待处理';
+        return;
+    }
+
+    panel.style.display = '';
+    if (countEl) countEl.textContent = `${visibleItems.length} 项待处理`;
+    body.innerHTML = visibleItems.slice(0, 8).map(item => {
+        const priority = getDashboardIssuePriorityMeta(item.priority);
+        const issueKey = getDashboardIssueKey(item);
+        return `
+            <div class="border rounded-3 p-3 mb-2 dashboard-issue-item" data-issue-key="${escapeHtml(issueKey)}">
+                <div class="d-flex justify-content-between gap-3 align-items-start">
+                    <div>
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="badge bg-${priority.className}">${priority.text}</span>
+                            <strong>${escapeHtml(item.title || '待处理问题')}</strong>
+                        </div>
+                        <div class="text-muted small">${escapeHtml(item.description || '')}</div>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap justify-content-end">
+                        <button
+                            type="button"
+                            class="btn btn-sm btn-outline-primary"
+                            data-dashboard-issue-action="${escapeHtml(item.action || '')}"
+                            data-cookie-id="${escapeHtml(item.cookie_id || '')}"
+                        >
+                            ${escapeHtml(item.action_label || '处理')}
+                        </button>
+                        <button
+                            type="button"
+                            class="btn btn-sm btn-outline-secondary"
+                            data-dashboard-issue-ignore="true"
+                            data-issue-key="${escapeHtml(issueKey)}"
+                        >
+                            忽略一次
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    bindDashboardIssueCenterActions();
+}
+
+function handleDashboardIssueAction(action, cookieId) {
+    const normalized = String(action || '').trim();
+    if (normalized === 'open_risk_logs') {
+        showSection('risk-control-logs');
+        return;
+    }
+    if (normalized === 'open_task_logs' || normalized === 'open_logs') {
+        showSection('logs');
+        return;
+    }
+    showSection('accounts');
+    if (cookieId && typeof openAccountManagement === 'function') {
+        setTimeout(() => openAccountManagement(cookieId), 150);
+    }
+}
+
+function ignoreDashboardIssueOnce(issueKey) {
+    const ignored = getDashboardIssueCenterIgnoredKeys();
+    ignored.add(String(issueKey || ''));
+    saveDashboardIssueCenterIgnoredKeys(ignored);
+    const issueEl = document.querySelector(`[data-issue-key="${CSS.escape(String(issueKey || ''))}"]`);
+    if (issueEl) {
+        issueEl.remove();
+    }
+    const body = document.getElementById('dashboardIssueCenterBody');
+    const countEl = document.getElementById('dashboardIssueCenterCount');
+    const remaining = body ? body.querySelectorAll('.dashboard-issue-item').length : 0;
+    if (countEl) countEl.textContent = `${remaining} 项待处理`;
+    if (!remaining) {
+        const panel = document.getElementById('dashboardIssueCenter');
+        if (panel) panel.style.display = 'none';
+    }
+}
+
 function renderDashboardHealthSummary(payload) {
     const container = document.getElementById('dashboardHealthSummary');
     const updatedAt = document.getElementById('dashboardHealthUpdatedAt');
@@ -1097,6 +1249,7 @@ function renderDashboardHealthSummary(payload) {
     }
 
     if (!payload || payload.success === false) {
+        renderDashboardIssueCenter(null);
         container.innerHTML = `
             <div class="text-danger">
                 <i class="bi bi-exclamation-triangle me-1"></i>
@@ -1112,6 +1265,7 @@ function renderDashboardHealthSummary(payload) {
     const captcha = payload.captcha || {};
     const recentFailures = payload.recent_failures || {};
     const failures = Array.isArray(recentFailures.items) ? recentFailures.items : [];
+    renderDashboardIssueCenter(payload.action_items || { items: [] });
 
     if (updatedAt) {
         updatedAt.textContent = `最后更新: ${formatDateTime(payload.generated_at || '') || '-'}`;
@@ -3415,38 +3569,90 @@ async function handleApiError(err) {
 async function fetchJSON(url, opts = {}) {
     toggleLoading(true);
     try {
-    const res = await authenticatedFetch(url, opts);
-    if (res.status === 401) {
-        // 未授权，跳转到登录页面
-        localStorage.removeItem('auth_token');
-        window.location.href = '/';
-        return;
-    }
-    if (!res.ok) {
-        let errorMessage = `HTTP ${res.status}`;
-        try {
-        const errorText = await res.text();
-        if (errorText) {
-            // 尝试解析JSON错误信息
+        const res = await authenticatedFetch(url, opts);
+        if (res.status === 401) {
+            // 未授权，跳转到登录页面
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!res.ok) {
+            let errorMessage = `HTTP ${res.status}`;
             try {
-            const errorJson = JSON.parse(errorText);
-            errorMessage = errorJson.detail || errorJson.message || errorText;
+                const errorText = await res.text();
+                if (errorText) {
+                    // 尝试解析JSON错误信息
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        errorMessage = errorJson.detail || errorJson.message || errorText;
+                    } catch {
+                        errorMessage = errorText;
+                    }
+                }
             } catch {
-            errorMessage = errorText;
+                errorMessage = `HTTP ${res.status} ${res.statusText}`;
             }
+            throw new Error(errorMessage);
         }
-        } catch {
-        errorMessage = `HTTP ${res.status} ${res.statusText}`;
-        }
-        throw new Error(errorMessage);
-    }
-    const data = await res.json();
-    toggleLoading(false);
-    return data;
+        return await res.json();
     } catch (err) {
-    handleApiError(err);
-    throw err;
+        handleApiError(err);
+        throw err;
+    } finally {
+        toggleLoading(false);
     }
+}
+
+async function cancelPendingAdminAction(actionId) {
+    if (!actionId) {
+        return null;
+    }
+    return fetchJSON(`${apiBase}/admin/pending-actions/${encodeURIComponent(actionId)}/cancel`, {
+        method: 'POST'
+    });
+}
+
+async function confirmPendingAdminAction(pendingAction, endpoint, options = {}, confirmationPayload = {}) {
+    const pendingActionId = pendingAction?.id || pendingAction?.pending_action_id;
+    const nextPayload = {
+        ...confirmationPayload,
+        pending_action_id: pendingActionId
+    };
+    return fetchJSON(endpoint, {
+        ...options,
+        body: JSON.stringify(nextPayload),
+        headers: {
+            'Content-Type': 'application/json',
+            ...(options.headers || {})
+        }
+    });
+}
+
+async function createPendingAdminAction(endpoint, options = {}, confirmationPayload = {}, confirmText = '') {
+    const response = await fetchJSON(endpoint, {
+        ...options,
+        body: JSON.stringify(confirmationPayload),
+        headers: {
+            'Content-Type': 'application/json',
+            ...(options.headers || {})
+        }
+    });
+    if (!response?.pending_action_required) {
+        return response;
+    }
+
+    const pendingAction = response.pending_action || { id: response.pending_action_id };
+    const message = confirmText || response.message || '该操作需要管理员二次确认，是否继续执行？';
+    if (!window.confirm(message)) {
+        await cancelPendingAdminAction(pendingAction.id);
+        return {
+            success: false,
+            cancelled: true,
+            pending_action_id: pendingAction.id,
+            message: '已取消待确认操作'
+        };
+    }
+    return confirmPendingAdminAction(pendingAction, endpoint, options, confirmationPayload);
 }
 
 // ================================
@@ -10721,15 +10927,14 @@ async function doRestartSystem() {
     try {
         showToast('正在重启系统...', 'info');
 
-        const response = await fetch('/api/update/restart', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
+        // createPendingAdminAction -> fetchJSON -> authenticatedFetch
+        const result = await createPendingAdminAction('/api/update/restart', {
+            method: 'POST'
+        }, { confirm_action: 'restart_application' }, '系统将立即重启并短暂不可用，请再次确认。');
 
-        if (response.ok) {
-            const result = await response.json();
+        if (result.cancelled) {
+            showToast(result.message || '已取消重启系统', 'info');
+        } else if (result.success) {
             showToast('系统正在重启，请稍候刷新页面...', 'success');
 
             // 5秒后自动刷新页面
@@ -10737,8 +10942,7 @@ async function doRestartSystem() {
                 window.location.reload();
             }, 5000);
         } else {
-            const error = await response.json();
-            showToast(`重启失败: ${error.detail || error.message || '未知错误'}`, 'danger');
+            showToast(`重启失败: ${result.detail || result.message || '未知错误'}`, 'danger');
         }
     } catch (error) {
         console.error('重启系统失败:', error);
@@ -17805,17 +18009,13 @@ async function confirmDeleteUser() {
     if (!currentDeleteUserId) return;
 
     try {
-        const token = localStorage.getItem('auth_token');
-
-        const response = await fetch(`/admin/users/${currentDeleteUserId}`, {
+        const data = await createPendingAdminAction(`/admin/users/${currentDeleteUserId}`, {
             method: 'DELETE',
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        });
+        }, {}, `确认删除用户 ${currentDeleteUserName || currentDeleteUserId}？`);
 
-        if (response.ok) {
-            const data = await response.json();
+        if (data.cancelled) {
+            showToast(data.message || '已取消删除用户', 'info');
+        } else if (data.message) {
             deleteUserModal.hide();
             showToast(data.message || '用户删除成功', 'success');
 
@@ -17823,8 +18023,7 @@ async function confirmDeleteUser() {
             await loadUserSystemStats();
             await loadUsers();
         } else {
-            const errorData = await response.json();
-            showToast(`删除失败: ${errorData.detail || '未知错误'}`, 'danger');
+            showToast('删除失败: 未知错误', 'danger');
         }
     } catch (error) {
         console.error('删除用户失败:', error);
@@ -18118,22 +18317,22 @@ async function clearTableData() {
     if (!confirmed) return;
 
     try {
-        const token = localStorage.getItem('auth_token');
-        const response = await fetch(`/admin/data/${currentTable}`, {
-            method: 'DELETE',
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        });
+        // createPendingAdminAction -> fetchJSON -> authenticatedFetch
+        const data = await createPendingAdminAction(`/admin/data/${currentTable}`, {
+            method: 'DELETE'
+        }, {
+                confirm_action: 'clear_table_data',
+                confirm_target: currentTable
+        }, `请再次确认清空 "${description}" 的所有数据。`);
 
-        if (response.ok) {
-            const data = await response.json();
+        if (data.cancelled) {
+            showToast(data.message || '已取消清空数据', 'info');
+        } else if (data.success) {
             showToast(data.message || '数据清空成功', 'success');
             // 重新加载数据
             loadTableData();
         } else {
-            const errorData = await response.json();
-            showToast(`清空失败: ${errorData.detail || '未知错误'}`, 'danger');
+            showToast(`清空失败: ${data.message || '未知错误'}`, 'danger');
         }
     } catch (error) {
         console.error('清空数据失败:', error);
@@ -21753,19 +21952,21 @@ async function performHotUpdate() {
         showHotUpdateProgress();
         
         // 执行更新
-        const response = await fetch('/api/update/apply', {
+        // createPendingAdminAction -> fetchJSON -> authenticatedFetch
+        const result = await createPendingAdminAction('/api/update/apply', {
             method: 'POST',
             headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Accept': 'application/json'
             }
-        });
-        
-        const result = await response.json();
+        }, { confirm_action: 'apply_update' }, '热更新将替换本地文件，请再次确认是否执行。');
         
         // 关闭进度弹窗
         closeHotUpdateProgress();
+
+        if (result.cancelled) {
+            showToast(result.message || '已取消热更新', 'info');
+            return;
+        }
         
         if (result.success && result.data.success) {
             // 更新成功
@@ -22084,18 +22285,17 @@ async function restartApplication() {
     try {
         showToast('正在重启应用...', 'info');
         
-        const response = await fetch('/api/update/restart', {
+        // createPendingAdminAction -> fetchJSON -> authenticatedFetch
+        const result = await createPendingAdminAction('/api/update/restart', {
             method: 'POST',
             headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Accept': 'application/json'
             }
-        });
+        }, { confirm_action: 'restart_application' }, '应用将立即重启，请再次确认。');
         
-        const result = await response.json();
-        
-        if (result.success) {
+        if (result.cancelled) {
+            showToast(result.message || '已取消重启应用', 'info');
+        } else if (result.success) {
             showToast('应用正在重启，页面将在5秒后自动刷新...', 'success');
             
             // 5秒后刷新页面

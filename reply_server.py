@@ -16,6 +16,7 @@ import re
 import uuid
 import base64
 import socket
+import ipaddress
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -72,8 +73,19 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 ADMIN_USERNAME = "admin"
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+MAX_ADMIN_LOG_LINES = 1000  # 管理端单次日志读取上限，避免大日志拖垮页面
+TRUSTED_PROXY_CIDRS = tuple(
+    cidr.strip()
+    for cidr in os.getenv(
+        'TRUSTED_PROXY_CIDRS',
+        '127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16',
+    ).split(',')
+    if cidr.strip()
+)
 
 # HTTP Bearer认证
+PENDING_ADMIN_ACTION_TTL_SECONDS = 300
+pending_admin_actions: Dict[str, Dict[str, Any]] = {}
 security = HTTPBearer(auto_error=False)
 
 # 扫码登录检查锁 - 防止并发处理同一个session
@@ -1007,6 +1019,30 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
     return current_user
 
 
+async def require_admin_confirmation(
+    request: Request,
+    expected_action: str,
+    expected_target: str = '',
+) -> Dict[str, Any]:
+    """校验高风险管理操作的显式确认字段。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    confirm_action = str(payload.get('confirm_action') or '').strip()
+    confirm_target = str(payload.get('confirm_target') or '').strip()
+    if confirm_action != expected_action:
+        raise HTTPException(status_code=400, detail="缺少高风险操作确认字段")
+    if expected_target and confirm_target != expected_target:
+        raise HTTPException(status_code=400, detail="高风险操作确认目标不匹配")
+
+    return payload
+
+
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
     """带用户信息的日志记录"""
     prefix = get_user_log_prefix(user_info)
@@ -1024,15 +1060,47 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
         logger.info(full_message)
 
 
+def _is_trusted_proxy_ip(client_host: str) -> bool:
+    try:
+        client_ip = ipaddress.ip_address(str(client_host or '').strip())
+    except ValueError:
+        return False
+
+    for cidr in TRUSTED_PROXY_CIDRS:
+        try:
+            if client_ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            logger.warning(f"忽略无效 TRUSTED_PROXY_CIDRS 条目: {cidr}")
+    return False
+
+
+def _get_first_valid_forwarded_ip(header_value: str) -> str:
+    for value in str(header_value or '').split(','):
+        candidate = value.strip()
+        if not candidate:
+            continue
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return ''
+
+
 def get_request_client_ip(request: Optional[Request] = None) -> str:
-    """获取请求来源 IP，优先使用反向代理传递的 X-Forwarded-For。"""
+    """获取请求来源 IP；仅在请求来自可信代理时接受转发头。"""
     if not request:
         return ''
     try:
-        forwarded_for = request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
-        if forwarded_for:
-            return forwarded_for
-        return request.client.host if request.client else ''
+        direct_ip = request.client.host if request.client else ''
+        if _is_trusted_proxy_ip(direct_ip):
+            forwarded_for = _get_first_valid_forwarded_ip(request.headers.get('X-Forwarded-For', ''))
+            if forwarded_for:
+                return forwarded_for
+            real_ip = _get_first_valid_forwarded_ip(request.headers.get('X-Real-IP', ''))
+            if real_ip:
+                return real_ip
+        return direct_ip or ''
     except Exception:
         return ''
 
@@ -1061,6 +1129,185 @@ def record_admin_audit(
     except Exception as e:
         logger.warning(f"记录管理员审计日志失败: {mask_sensitive_text(e)}")
         return None
+
+
+def _pending_admin_action_snapshot(action: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': action.get('id'),
+        'action': action.get('action'),
+        'target_type': action.get('target_type', ''),
+        'target_id': action.get('target_id', ''),
+        'payload': action.get('payload') or {},
+        'created_at': action.get('created_at_iso', ''),
+        'expires_at': action.get('expires_at_iso', ''),
+        'created_by': action.get('created_by', ''),
+        'status': action.get('status', 'pending'),
+    }
+
+
+def _cleanup_pending_admin_actions() -> None:
+    now = time.time()
+    expired_ids = [
+        action_id
+        for action_id, action in list(pending_admin_actions.items())
+        if float(action.get('expires_at') or 0) <= now
+    ]
+    for action_id in expired_ids:
+        action = pending_admin_actions.pop(action_id, None)
+        if not action:
+            continue
+        action['status'] = 'expired'
+        record_admin_audit(
+            action.get('admin_user') or {},
+            action='admin_action.expired',
+            target_type=action.get('target_type', ''),
+            target_id=action.get('target_id', ''),
+            result='expired',
+            details={'pending_action_id': action_id, 'action': action.get('action')},
+        )
+
+
+def create_pending_admin_action(
+    admin_user: Dict[str, Any],
+    action: str,
+    target_type: str = '',
+    target_id: str = '',
+    payload: Optional[Dict[str, Any]] = None,
+    request: Optional[Request] = None,
+) -> Dict[str, Any]:
+    _cleanup_pending_admin_actions()
+    now = time.time()
+    action_id = uuid.uuid4().hex
+    expires_at = now + PENDING_ADMIN_ACTION_TTL_SECONDS
+    entry = {
+        'id': action_id,
+        'action': str(action or ''),
+        'target_type': str(target_type or ''),
+        'target_id': str(target_id or ''),
+        'payload': payload or {},
+        'created_at': now,
+        'expires_at': expires_at,
+        'created_at_iso': datetime.fromtimestamp(now, LOCAL_TIMEZONE).isoformat(),
+        'expires_at_iso': datetime.fromtimestamp(expires_at, LOCAL_TIMEZONE).isoformat(),
+        'created_by': (admin_user or {}).get('username', ''),
+        'created_by_user_id': (admin_user or {}).get('user_id'),
+        'admin_user': dict(admin_user or {}),
+        'status': 'pending',
+    }
+    pending_admin_actions[action_id] = entry
+    record_admin_audit(
+        admin_user,
+        action='admin_action.pending',
+        target_type=entry['target_type'],
+        target_id=entry['target_id'],
+        request=request,
+        details={'pending_action_id': action_id, 'action': entry['action']},
+    )
+    return _pending_admin_action_snapshot(entry)
+
+
+def confirm_pending_admin_action(
+    action_id: str,
+    admin_user: Dict[str, Any],
+    request: Optional[Request] = None,
+    expected_action: str = '',
+    expected_target_id: str = '',
+) -> Dict[str, Any]:
+    normalized_id = str(action_id or '').strip()
+    action = pending_admin_actions.get(normalized_id)
+    if not action:
+        raise HTTPException(status_code=404, detail='待确认操作不存在或已过期')
+    if float(action.get('expires_at') or 0) <= time.time():
+        pending_admin_actions.pop(normalized_id, None)
+        action['status'] = 'expired'
+        record_admin_audit(
+            admin_user,
+            action='admin_action.expired',
+            target_type=action.get('target_type', ''),
+            target_id=action.get('target_id', ''),
+            result='expired',
+            request=request,
+            details={'pending_action_id': normalized_id, 'action': action.get('action')},
+        )
+        raise HTTPException(status_code=400, detail='待确认操作已过期，请重新发起')
+
+    if expected_action and action.get('action') != expected_action:
+        raise HTTPException(status_code=400, detail='待确认操作类型不匹配')
+    if expected_target_id and str(action.get('target_id') or '') != str(expected_target_id or ''):
+        raise HTTPException(status_code=400, detail='待确认操作目标不匹配')
+
+    pending_admin_actions.pop(normalized_id, None)
+    action['status'] = 'confirmed'
+    record_admin_audit(
+        admin_user,
+        action='admin_action.confirmed',
+        target_type=action.get('target_type', ''),
+        target_id=action.get('target_id', ''),
+        request=request,
+        details={'pending_action_id': normalized_id, 'action': action.get('action')},
+    )
+    return action
+
+
+def cancel_pending_admin_action(
+    action_id: str,
+    admin_user: Dict[str, Any],
+    request: Optional[Request] = None,
+) -> Dict[str, Any]:
+    normalized_id = str(action_id or '').strip()
+    action = pending_admin_actions.pop(normalized_id, None)
+    if not action:
+        raise HTTPException(status_code=404, detail='待确认操作不存在或已过期')
+    action['status'] = 'cancelled'
+    record_admin_audit(
+        admin_user,
+        action='admin_action.cancelled',
+        target_type=action.get('target_type', ''),
+        target_id=action.get('target_id', ''),
+        request=request,
+        details={'pending_action_id': normalized_id, 'action': action.get('action')},
+    )
+    return _pending_admin_action_snapshot(action)
+
+
+def _pending_admin_action_required_response(pending_action: Dict[str, Any], message: str) -> Dict[str, Any]:
+    return {
+        'success': False,
+        'pending_action_required': True,
+        'pending_action': pending_action,
+        'pending_action_id': pending_action.get('id'),
+        'message': message,
+    }
+
+
+def _require_pending_admin_action(
+    payload: Dict[str, Any],
+    admin_user: Dict[str, Any],
+    action: str,
+    target_type: str,
+    target_id: str,
+    request: Optional[Request],
+) -> Optional[Dict[str, Any]]:
+    pending_action_id = str((payload or {}).get('pending_action_id') or '').strip()
+    if pending_action_id:
+        confirm_pending_admin_action(
+            pending_action_id,
+            admin_user,
+            request=request,
+            expected_action=action,
+            expected_target_id=str(target_id or ''),
+        )
+        return None
+
+    pending_action = create_pending_admin_action(
+        admin_user,
+        action=action,
+        target_type=target_type,
+        target_id=str(target_id or ''),
+        payload=payload,
+        request=request,
+    )
+    return _pending_admin_action_required_response(pending_action, '该高风险操作已进入待确认队列，请二次确认后执行')
 
 
 def _get_blacklist_block_by_cookie(cookie_id: str, buyer_id: str, item_id: str = None) -> Optional[Dict[str, Any]]:
@@ -1309,9 +1556,7 @@ async def root():
 async def generate_captcha(request: Request):
     """生成验证码图片"""
     # 获取客户端IP
-    client_ip = request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or \
-                request.headers.get('X-Real-IP', '') or \
-                request.client.host if request.client else 'unknown'
+    client_ip = get_request_client_ip(request) or 'unknown'
     
     # 清理过期验证码
     cleanup_expired_captchas()
@@ -1346,9 +1591,7 @@ async def generate_captcha(request: Request):
 @app.get('/captcha/check-required')
 async def check_captcha_required(request: Request):
     """检查是否需要验证码"""
-    client_ip = request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or \
-                request.headers.get('X-Real-IP', '') or \
-                request.client.host if request.client else 'unknown'
+    client_ip = get_request_client_ip(request) or 'unknown'
     
     required = is_captcha_required(client_ip)
     failure_count = get_ip_failure_count(client_ip)
@@ -1487,9 +1730,7 @@ async def login(login_request: LoginRequest, request: Request):
     from db_manager import db_manager
     
     # 获取客户端IP（考虑代理）
-    client_ip = request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or \
-                request.headers.get('X-Real-IP', '') or \
-                request.client.host if request.client else 'unknown'
+    client_ip = get_request_client_ip(request) or 'unknown'
     
     # 定期清理过期记录
     cleanup_login_trackers()
@@ -11601,7 +11842,7 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete('/admin/users/{user_id}')
-def delete_user(user_id: int, request: Request, admin_user: Dict[str, Any] = Depends(require_admin)):
+async def delete_user(user_id: int, request: Request, admin_user: Dict[str, Any] = Depends(require_admin)):
     """删除用户（管理员专用）"""
     from db_manager import db_manager
     try:
@@ -11614,6 +11855,23 @@ def delete_user(user_id: int, request: Request, admin_user: Dict[str, Any] = Dep
         user_to_delete = db_manager.get_user_by_id(user_id)
         if not user_to_delete:
             raise HTTPException(status_code=404, detail="用户不存在")
+
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        pending_response = _require_pending_admin_action(
+            payload,
+            admin_user,
+            action='user.delete',
+            target_type='user',
+            target_id=str(user_id),
+            request=request,
+        )
+        if pending_response:
+            return pending_response
 
         log_with_user('info', f"准备删除用户: {user_to_delete['username']} (ID: {user_id})", admin_user)
 
@@ -11827,6 +12085,30 @@ def get_admin_cookies(admin_user: Dict[str, Any] = Depends(require_admin)):
         }
 
 
+@app.get('/admin/pending-actions')
+def list_pending_admin_actions(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """List active high-risk admin actions waiting for confirmation."""
+    _cleanup_pending_admin_actions()
+    return {
+        "success": True,
+        "actions": [
+            _pending_admin_action_snapshot(action)
+            for action in sorted(
+                pending_admin_actions.values(),
+                key=lambda item: float(item.get('created_at') or 0),
+                reverse=True,
+            )
+        ],
+    }
+
+
+@app.post('/admin/pending-actions/{action_id}/cancel')
+def cancel_admin_pending_action(action_id: str, request: Request, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Cancel a high-risk admin action before it is confirmed."""
+    action = cancel_pending_admin_action(action_id, admin_user, request=request)
+    return {"success": True, "action": action, "message": "已取消待确认操作"}
+
+
 @app.get('/admin/logs')
 def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
                    lines: int = 100,
@@ -11837,6 +12119,11 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
     from datetime import datetime
 
     try:
+        try:
+            lines = int(lines)
+        except (TypeError, ValueError):
+            lines = 100
+        lines = max(1, min(lines, MAX_ADMIN_LOG_LINES))
         log_with_user('info', f"查询系统日志，行数: {lines}, 级别: {level}", admin_user)
 
         # 查找日志文件
@@ -12560,7 +12847,7 @@ def delete_table_record(table_name: str, record_id: str, request: Request, admin
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete('/admin/data/{table_name}')
-def clear_table_data(table_name: str, request: Request, admin_user: Dict[str, Any] = Depends(require_admin)):
+async def clear_table_data(table_name: str, request: Request, admin_user: Dict[str, Any] = Depends(require_admin)):
     """清空指定表的所有数据（管理员专用）"""
     from db_manager import db_manager
     try:
@@ -12584,6 +12871,18 @@ def clear_table_data(table_name: str, request: Request, admin_user: Dict[str, An
             log_with_user('warning', f"尝试清空不允许的表: {table_name}", admin_user)
             raise HTTPException(status_code=400, detail="不允许清空该表")
 
+        payload = await require_admin_confirmation(request, 'clear_table_data', table_name)
+        pending_response = _require_pending_admin_action(
+            payload,
+            admin_user,
+            action='data.clear_table',
+            target_type='table',
+            target_id=table_name,
+            request=request,
+        )
+        if pending_response:
+            return pending_response
+
         # 清空表数据
         success = db_manager.clear_table_data(table_name)
 
@@ -12595,7 +12894,7 @@ def clear_table_data(table_name: str, request: Request, admin_user: Dict[str, An
                 target_type='table',
                 target_id=table_name,
                 request=request,
-                details={'table_name': table_name},
+                details={'table_name': table_name, 'confirm_action': 'clear_table_data'},
             )
             return {"success": True, "message": "清空成功"}
         else:
@@ -14991,16 +15290,24 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
 
 
 @app.post('/api/update/apply')
-async def apply_updates(request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def apply_updates(request: Request, current_user: Dict[str, Any] = Depends(require_admin)):
     """
     应用更新
     
     下载并安装所有可用更新
     """
     try:
-        # 只允许管理员执行更新，兼容历史 admin 用户名判断
-        if not is_admin_user(current_user):
-            raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
+        payload = await require_admin_confirmation(request, 'apply_update')
+        pending_response = _require_pending_admin_action(
+            payload,
+            current_user,
+            action='update.apply',
+            target_type='update',
+            target_id='application',
+            request=request,
+        )
+        if pending_response:
+            return pending_response
         
         updater = get_updater()
         
@@ -15024,6 +15331,7 @@ async def apply_updates(request: Request, current_user: Dict[str, Any] = Depends
                 'updated_files': result.get('updated_files', []),
                 'deleted_files': result.get('deleted_files', []),
                 'needs_restart': result.get('needs_restart'),
+                'confirm_action': 'apply_update',
             },
         )
         
@@ -15257,15 +15565,24 @@ async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_us
 
 
 @app.post('/api/update/restart')
-async def restart_application(request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def restart_application(request: Request, current_user: Dict[str, Any] = Depends(require_admin)):
     """
     重启应用（用于更新后重启）
     
     注意：此操作会重启整个应用
     """
     try:
-        if not is_admin_user(current_user):
-            raise HTTPException(status_code=403, detail="只有管理员可以重启应用")
+        payload = await require_admin_confirmation(request, 'restart_application')
+        pending_response = _require_pending_admin_action(
+            payload,
+            current_user,
+            action='update.restart',
+            target_type='application',
+            target_id='process',
+            request=request,
+        )
+        if pending_response:
+            return pending_response
         
         log_with_user('info', "用户请求重启应用", current_user)
         record_admin_audit(
@@ -15274,6 +15591,7 @@ async def restart_application(request: Request, current_user: Dict[str, Any] = D
             target_type='application',
             target_id='process',
             request=request,
+            details={'confirm_action': 'restart_application'},
         )
         
         import subprocess

@@ -40,8 +40,25 @@ class ReplyServerHighRiskAuthTests(unittest.TestCase):
             route_index = source.index(route)
             next_route = source.find("\n@app.", route_index + 1)
             block = source[route_index: next_route if next_route != -1 else len(source)]
-            self.assertIn("is_admin_user(current_user)", block, route)
+            self.assertIn("Depends(require_admin)", block, route)
+            self.assertIn("require_admin_confirmation", block, route)
             self.assertNotRegex(block, re.compile(r"username['\"]?\s*==\s*['\"]admin['\"]"))
+
+    def test_destructive_admin_routes_require_explicit_confirmation(self):
+        source = read_reply_server()
+        destructive_routes = [
+            "@app.delete('/admin/data/{table_name}')",
+            "@app.post('/api/update/apply')",
+            "@app.post('/api/update/restart')",
+        ]
+
+        self.assertIn("def require_admin_confirmation", source)
+        for route in destructive_routes:
+            route_index = source.index(route)
+            next_route = source.find("\n@app.", route_index + 1)
+            block = source[route_index: next_route if next_route != -1 else len(source)]
+            self.assertIn("confirm_action", block, route)
+            self.assertIn("require_admin_confirmation", block, route)
 
     def test_session_tokens_do_not_use_static_jwt_secret_fallback(self):
         source = read_reply_server()
@@ -51,6 +68,27 @@ class ReplyServerHighRiskAuthTests(unittest.TestCase):
         self.assertNotIn("JWT_SECRET_KEY = ", source)
         self.assertNotIn("jwt.encode", source)
         self.assertNotIn("jwt.decode", source)
+
+    def test_client_ip_trusts_forwarded_headers_only_from_trusted_proxies(self):
+        source = read_reply_server()
+
+        self.assertIn("TRUSTED_PROXY_CIDRS", source)
+        self.assertIn("def _is_trusted_proxy_ip", source)
+        self.assertIn("def _get_first_valid_forwarded_ip", source)
+        self.assertIn("if _is_trusted_proxy_ip(direct_ip):", source)
+
+        sensitive_routes = [
+            "@app.get('/captcha/generate')",
+            "@app.get('/captcha/check-required')",
+            "@app.post('/login')",
+        ]
+        for route in sensitive_routes:
+            route_index = source.index(route)
+            next_route = source.find("\n@app.", route_index + 1)
+            block = source[route_index: next_route if next_route != -1 else len(source)]
+            self.assertIn("get_request_client_ip(request)", block, route)
+            self.assertNotIn("request.headers.get('X-Forwarded-For'", block, route)
+            self.assertNotIn("request.headers.get('X-Real-IP'", block, route)
 
 
 if __name__ == "__main__":

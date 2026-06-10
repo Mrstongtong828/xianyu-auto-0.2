@@ -20,8 +20,8 @@ services:
     # 即使挂载了 Windows 文件，bash 也能正确处理
     entrypoint: ["/bin/bash", "-c", "dos2unix /app/entrypoint.sh 2>/dev/null || true; bash /app/entrypoint.sh"]
     ports:
-      - "9000:8090"
-      - "5900:5900"    # VNC 端口（可选，用于远程查看浏览器）
+      - "127.0.0.1:9000:8090"
+      - "127.0.0.1:5900:5900"    # VNC 端口（可选，用于远程查看浏览器）
     volumes:
       # 数据持久化
       - ./data:/app/data:rw
@@ -51,8 +51,8 @@ services:
       - SQL_LOG_ENABLED=${SQL_LOG_ENABLED:-true}
       - SQL_LOG_LEVEL=${SQL_LOG_LEVEL:-INFO}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default-secret-key}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD before running docker compose}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?set JWT_SECRET_KEY before running docker compose}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600}
       # 多用户系统配置
       - MULTIUSER_ENABLED=${MULTIUSER_ENABLED:-true}

@@ -52,6 +52,11 @@ class AdminHealthSummaryTests(unittest.TestCase):
         self.assertEqual(summary["credentials"]["suspected_expired"], 1)
         self.assertEqual(summary["captcha"]["pending"], 1)
         self.assertEqual(summary["recent_failures"]["count"], 2)
+        self.assertIn("action_items", summary)
+        action_types = [item["type"] for item in summary["action_items"]["items"]]
+        self.assertIn("token_unready", action_types)
+        self.assertIn("account_disabled", action_types)
+        self.assertIn("risk_control_pending", action_types)
         self.assertIn("generated_at", summary)
         self.assertNotIn("masked-cookie-a", str(summary))
         self.assertNotIn("secret-token", str(summary))

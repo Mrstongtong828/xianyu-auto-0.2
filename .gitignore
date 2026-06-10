@@ -292,6 +292,11 @@ build/
 # 文档文件（除了README.md）
 *.md
 !README.md
+!installer/README.md
+!docs/windows-docker-installer-user-guide.md
+!docs/superpowers/
+!docs/superpowers/plans/
+!docs/superpowers/plans/*.md
 !CHANGELOG.md
 !CONTRIBUTING.md
 !SECURITY.md

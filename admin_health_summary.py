@@ -56,6 +56,28 @@ def _health_summary_task_entry(log: Dict[str, Any], source: str) -> Dict[str, An
     }
 
 
+def _action_item(
+    item_type: str,
+    priority: str,
+    title: str,
+    description: str,
+    action: str,
+    label: str,
+    cookie_id: str = "",
+    source_id: Any = None,
+) -> Dict[str, Any]:
+    return {
+        "type": item_type,
+        "priority": priority,
+        "title": title,
+        "description": description,
+        "cookie_id": str(cookie_id or ""),
+        "source_id": source_id,
+        "action": action,
+        "action_label": label,
+    }
+
+
 def build_admin_health_summary(
     current_user: Dict[str, Any],
     db_manager: Any,
@@ -147,6 +169,78 @@ def build_admin_health_summary(
         logger.warning(f"health summary risk log failed: {_mask_summary_error(exc)}")
 
     recent_failures = recent_failures[:10]
+    action_items: List[Dict[str, Any]] = []
+    for account in accounts:
+        account_id = str(account.get("id") or "")
+        if not account.get("token_ready"):
+            action_items.append(_action_item(
+                "token_unready",
+                "high",
+                f"账号 {account_id} Token 未就绪",
+                "账号可能需要重新登录、刷新 Cookie 或执行会话保活。",
+                "open_account",
+                "打开账号",
+                cookie_id=account_id,
+            ))
+        if not account.get("message_stream_ready") and account.get("enabled"):
+            action_items.append(_action_item(
+                "message_stream_disconnected",
+                "medium",
+                f"账号 {account_id} 消息流未连接",
+                "自动回复和在线客服可能无法及时接收新消息。",
+                "open_account",
+                "打开账号",
+                cookie_id=account_id,
+            ))
+        if not account.get("enabled"):
+            action_items.append(_action_item(
+                "account_disabled",
+                "medium",
+                f"账号 {account_id} 已禁用",
+                "该账号不会参与自动回复、自动发货或任务调度。",
+                "open_account",
+                "打开账号",
+                cookie_id=account_id,
+            ))
+
+    for session in pending_captcha[:5]:
+        action_items.append(_action_item(
+            "captcha_pending",
+            "high",
+            "存在待处理验证",
+            "有滑块、扫码、人脸或短信验证会话尚未完成。",
+            "open_risk_logs",
+            "查看风控",
+            source_id=session.get("session_id"),
+        ))
+
+    for failure in recent_failures:
+        source = failure.get("source")
+        task_type = str(failure.get("task_type") or "")
+        if source == "risk_control":
+            action_items.append(_action_item(
+                "risk_control_pending",
+                "high",
+                f"账号 {failure.get('cookie_id') or '-'} 风控待处理",
+                f"风控事件 {task_type or 'unknown'} 当前状态为 {failure.get('status') or '-'}。",
+                "open_risk_logs",
+                "查看风控",
+                cookie_id=failure.get("cookie_id") or "",
+                source_id=failure.get("id"),
+            ))
+        elif task_type == "auto_delivery":
+            action_items.append(_action_item(
+                "auto_delivery_failed",
+                "high",
+                "自动发货任务失败",
+                "近期自动发货任务失败，请查看任务日志定位原因。",
+                "open_task_logs",
+                "查看任务",
+                cookie_id=failure.get("cookie_id") or "",
+                source_id=failure.get("id"),
+            ))
+
+    action_items = action_items[:20]
     offline_count = max(0, len(accounts) - online_count)
     health_level = "healthy"
     if pending_captcha or recent_failures or suspected_expired_count:
@@ -180,5 +274,9 @@ def build_admin_health_summary(
         "recent_failures": {
             "count": len(recent_failures),
             "items": recent_failures,
+        },
+        "action_items": {
+            "count": len(action_items),
+            "items": action_items,
         },
     }
