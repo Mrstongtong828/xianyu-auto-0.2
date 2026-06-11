@@ -8,6 +8,7 @@ import json
 import time
 import aiohttp
 from loguru import logger
+from utils.task_rate_limiter import task_rate_limiter
 from utils.xianyu_utils import generate_sign, trans_cookies
 
 
@@ -201,6 +202,7 @@ class SecureConfirm:
                 proxy_url = None
 
             async with aiohttp.ClientSession(headers=request_headers, timeout=request_timeout) as session:
+                await task_rate_limiter.wait_for_turn("auto_delivery", self.cookie_id, order_id)
                 async with session.post(
                     'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
                     params=params,

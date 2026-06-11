@@ -11,6 +11,7 @@ import hashlib
 import secrets
 import time
 import json
+import math
 import os
 import re
 import uuid
@@ -29,7 +30,7 @@ from collections import defaultdict
 import cookie_manager
 import admin_health_summary
 from db_manager import db_manager
-from config import RISK_CONTROL
+from config import RISK_CONTROL, config
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from blacklist_service import blacklist_service
@@ -55,6 +56,7 @@ from utils.notification_dispatcher import (
 )
 from chat_event_hub import chat_event_hub, publish_chat_message
 from order_event_hub import order_event_hub, publish_order_update_event
+from utils.task_rate_limiter import task_rate_limiter
 
 from loguru import logger
 
@@ -3010,6 +3012,151 @@ class SystemSettingIn(BaseModel):
     description: Optional[str] = None
 
 
+TASK_RATE_LIMITER_DEFAULTS = {
+    'enabled': True,
+    'global_min_interval_seconds': 3,
+    'account_min_interval_seconds': 12,
+    'action_min_interval_seconds': 0,
+    'send_message_delay_min_seconds': 2,
+    'send_message_delay_max_seconds': 6,
+    'publish_delay_min_seconds': 30,
+    'publish_delay_max_seconds': 90,
+    'polish_delay_min_seconds': 20,
+    'polish_delay_max_seconds': 60,
+    'order_action_delay_min_seconds': 15,
+    'order_action_delay_max_seconds': 45,
+}
+
+TASK_RATE_LIMITER_FIELD_ORDER = list(TASK_RATE_LIMITER_DEFAULTS.keys())
+TASK_RATE_LIMITER_MIN_MAX_PAIRS = (
+    ('send_message_delay_min_seconds', 'send_message_delay_max_seconds', '自动回复延迟'),
+    ('publish_delay_min_seconds', 'publish_delay_max_seconds', '自动上架延迟'),
+    ('polish_delay_min_seconds', 'polish_delay_max_seconds', '自动擦亮延迟'),
+    ('order_action_delay_min_seconds', 'order_action_delay_max_seconds', '订单动作延迟'),
+)
+TASK_RATE_LIMITER_MAX_SECONDS = 24 * 60 * 60
+
+
+class TaskRateLimiterSettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    global_min_interval_seconds: Optional[float] = None
+    account_min_interval_seconds: Optional[float] = None
+    action_min_interval_seconds: Optional[float] = None
+    send_message_delay_min_seconds: Optional[float] = None
+    send_message_delay_max_seconds: Optional[float] = None
+    publish_delay_min_seconds: Optional[float] = None
+    publish_delay_max_seconds: Optional[float] = None
+    polish_delay_min_seconds: Optional[float] = None
+    polish_delay_max_seconds: Optional[float] = None
+    order_action_delay_min_seconds: Optional[float] = None
+    order_action_delay_max_seconds: Optional[float] = None
+
+
+def _coerce_task_rate_limiter_value(key: str, value: Any) -> Any:
+    if key == 'enabled':
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {'1', 'true', 'yes', 'on', 'enabled'}:
+            return True
+        if text in {'0', 'false', 'no', 'off', 'disabled'}:
+            return False
+        raise HTTPException(status_code=400, detail='任务限速开关只能为 true 或 false')
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f'{key} 必须是数字')
+
+    if not math.isfinite(number) or number < 0 or number > TASK_RATE_LIMITER_MAX_SECONDS:
+        raise HTTPException(status_code=400, detail=f'{key} 必须在 0-{TASK_RATE_LIMITER_MAX_SECONDS} 秒之间')
+
+    return int(number) if number.is_integer() else round(number, 3)
+
+
+def _get_task_rate_limiter_config() -> Dict[str, Any]:
+    current = dict(TASK_RATE_LIMITER_DEFAULTS)
+    saved = config.get('TASK_RATE_LIMITER', {})
+    if isinstance(saved, dict):
+        current.update({key: saved.get(key, value) for key, value in TASK_RATE_LIMITER_DEFAULTS.items()})
+
+    normalized = {}
+    for key, default_value in TASK_RATE_LIMITER_DEFAULTS.items():
+        try:
+            normalized[key] = _coerce_task_rate_limiter_value(key, current.get(key, default_value))
+        except HTTPException:
+            normalized[key] = default_value
+
+    for min_key, max_key, _label in TASK_RATE_LIMITER_MIN_MAX_PAIRS:
+        if normalized[max_key] < normalized[min_key]:
+            normalized[max_key] = normalized[min_key]
+
+    return normalized
+
+
+def _validate_task_rate_limiter_config(settings: Dict[str, Any]) -> None:
+    for min_key, max_key, label in TASK_RATE_LIMITER_MIN_MAX_PAIRS:
+        if settings[min_key] > settings[max_key]:
+            raise HTTPException(status_code=400, detail=f'{label}的最大值不能小于最小值')
+
+
+def _format_task_rate_limiter_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    return str(value)
+
+
+def _persist_task_rate_limiter_config(settings: Dict[str, Any]) -> Dict[str, Any]:
+    config.set('TASK_RATE_LIMITER', dict(settings))
+
+    config_path = Path(__file__).parent / 'global_config.yml'
+    try:
+        text = config_path.read_text(encoding='utf-8')
+        newline = '\r\n' if '\r\n' in text else '\n'
+        lines = text.splitlines()
+
+        section_lines = ['TASK_RATE_LIMITER:']
+        for key in TASK_RATE_LIMITER_FIELD_ORDER:
+            section_lines.append(f'  {key}: {_format_task_rate_limiter_value(settings[key])}')
+
+        start_index = None
+        for index, line in enumerate(lines):
+            if re.match(r'^TASK_RATE_LIMITER\s*:', line):
+                start_index = index
+                break
+
+        if start_index is None:
+            insert_index = len(lines)
+            for index, line in enumerate(lines):
+                if re.match(r'^TOKEN_REFRESH_INTERVAL\s*:', line):
+                    insert_index = index
+                    break
+            lines[insert_index:insert_index] = section_lines
+        else:
+            end_index = start_index + 1
+            while end_index < len(lines):
+                line = lines[end_index]
+                if line and not line.startswith((' ', '\t')) and re.match(r'^[A-Za-z0-9_]+\s*:', line):
+                    break
+                end_index += 1
+            lines[start_index:end_index] = section_lines
+
+        config_path.write_text(newline.join(lines) + (newline if text.endswith(('\n', '\r')) else ''), encoding='utf-8')
+        return {'persisted': True, 'path': str(config_path), 'fallback': False}
+    except OSError as exc:
+        override_path = Path(__file__).parent / 'data' / 'task_rate_limiter_config.json'
+        try:
+            override_path.parent.mkdir(parents=True, exist_ok=True)
+            override_path.write_text(
+                json.dumps(settings, ensure_ascii=False, indent=2) + '\n',
+                encoding='utf-8',
+            )
+            logger.warning(f"global_config.yml 不可写，任务限速配置已保存到运行期覆盖文件: {override_path} ({exc})")
+            return {'persisted': True, 'path': str(override_path), 'fallback': True}
+        except Exception as fallback_exc:
+            raise OSError(f"任务限速配置保存失败: {fallback_exc}") from exc
+
+
 NIGHT_MODE_SYSTEM_SETTING_KEYS = {
     'risk_control_night_mode_enabled',
     'risk_control_night_start_hour',
@@ -4405,21 +4552,39 @@ async def _run_live_instance_on_manager_loop(
 
 
 
+def _get_active_captcha_controller():
+    try:
+        from utils.captcha_remote_control import captcha_controller as active_captcha_controller
+        return active_captcha_controller
+    except Exception:
+        return None
+
+
+@app.get('/api/account-health-summary')
+def get_account_health_summary(current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        return admin_health_summary.build_admin_health_summary(
+            current_user=current_user,
+            db_manager=db_manager,
+            runtime_status_builder=_build_live_runtime_status,
+            captcha_controller=_get_active_captcha_controller(),
+            user_id=current_user.get('user_id'),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"build account health summary failed: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("健康总览加载失败，请稍后重试"))
+
+
 @app.get('/admin/health-summary')
 def get_admin_health_summary(admin_user: Dict[str, Any] = Depends(require_admin)):
     try:
-        captcha_controller = None
-        try:
-            from utils.captcha_remote_control import captcha_controller as active_captcha_controller
-            captcha_controller = active_captcha_controller
-        except Exception:
-            captcha_controller = None
-
         return admin_health_summary.build_admin_health_summary(
             current_user=admin_user,
             db_manager=db_manager,
             runtime_status_builder=_build_live_runtime_status,
-            captcha_controller=captcha_controller,
+            captcha_controller=_get_active_captcha_controller(),
         )
     except HTTPException:
         raise
@@ -8264,6 +8429,60 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, current_user:
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/task-rate-limiter-settings')
+def get_task_rate_limiter_settings(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """获取多账号任务限速配置"""
+    try:
+        return {
+            'success': True,
+            'config': _get_task_rate_limiter_config(),
+            'recommended': dict(TASK_RATE_LIMITER_DEFAULTS),
+            'status': task_rate_limiter.snapshot(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取任务限速配置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put('/task-rate-limiter-settings')
+def update_task_rate_limiter_settings(
+    setting_data: TaskRateLimiterSettingsUpdate,
+    admin_user: Dict[str, Any] = Depends(require_admin),
+):
+    """更新多账号任务限速配置"""
+    try:
+        current_settings = _get_task_rate_limiter_config()
+        incoming = setting_data.dict(exclude_unset=True)
+
+        for key, value in incoming.items():
+            if key not in TASK_RATE_LIMITER_DEFAULTS:
+                continue
+            current_settings[key] = _coerce_task_rate_limiter_value(key, value)
+
+        _validate_task_rate_limiter_config(current_settings)
+        persist_result = _persist_task_rate_limiter_config(current_settings)
+        log_with_user('info', '更新任务限速队列配置', admin_user)
+        message = '任务限速配置已保存并立即生效'
+        if persist_result.get('fallback'):
+            message = '任务限速配置已保存到 Docker 运行期配置，并立即生效'
+
+        return {
+            'success': True,
+            'message': message,
+            'config': current_settings,
+            'recommended': dict(TASK_RATE_LIMITER_DEFAULTS),
+            'status': task_rate_limiter.snapshot(),
+            'persist': persist_result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新任务限速配置失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

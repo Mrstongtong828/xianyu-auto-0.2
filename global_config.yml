@@ -96,6 +96,19 @@ RISK_CONTROL:
   post_slider_retry_delay_min: 5.0
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
+TASK_RATE_LIMITER:
+  enabled: true
+  global_min_interval_seconds: 3
+  account_min_interval_seconds: 12
+  action_min_interval_seconds: 0
+  send_message_delay_min_seconds: 2
+  send_message_delay_max_seconds: 6
+  publish_delay_min_seconds: 30
+  publish_delay_max_seconds: 90
+  polish_delay_min_seconds: 20
+  polish_delay_max_seconds: 60
+  order_action_delay_min_seconds: 15
+  order_action_delay_max_seconds: 45
 TOKEN_REFRESH_INTERVAL: 259200  # AccessToken 仅在初始化/重连前按需刷新，默认3天
 TOKEN_RETRY_INTERVAL: 3600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

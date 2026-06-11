@@ -6,6 +6,7 @@ from typing import Any
 
 from loguru import logger
 
+from utils.task_rate_limiter import task_rate_limiter
 from utils.xianyu_utils import generate_sign, trans_cookies
 
 
@@ -70,6 +71,7 @@ class ItemPolishModule:
         params, payload = self._build_polish_request('mtop.taobao.idle.item.polish', item_id)
 
         try:
+            await task_rate_limiter.wait_for_turn('polish', self.runtime.cookie_id, item_id)
             async with self.runtime.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.item.polish/1.0/',
                 params=params,
@@ -112,6 +114,7 @@ class ItemPolishModule:
         params, payload = self._build_polish_request('mtop.idle.item.polish', item_id)
 
         try:
+            await task_rate_limiter.wait_for_turn('polish', self.runtime.cookie_id, f"{item_id}:backup")
             async with self.runtime.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.idle.item.polish/1.0/',
                 params=params,

@@ -2,6 +2,7 @@ import asyncio
 import time
 import aiohttp
 from loguru import logger
+from utils.task_rate_limiter import task_rate_limiter
 from utils.xianyu_utils import trans_cookies, generate_sign
 
 
@@ -144,6 +145,7 @@ class SecureFreeshipping:
             # 设置请求超时
             request_timeout = aiohttp.ClientTimeout(total=30)
 
+            await task_rate_limiter.wait_for_turn("auto_delivery", self.cookie_id, order_id)
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.idle.groupon.activity.seller.freeshipping/1.0/',
                 params=params,

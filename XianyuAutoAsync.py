@@ -38,6 +38,7 @@ from utils.notification_dispatcher import (
     guess_verification_type,
     render_notification_template,
 )
+from utils.task_rate_limiter import task_rate_limiter
 
 
 MANUAL_VERIFICATION_CONTEXTS = {
@@ -12107,7 +12108,8 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        async with task_rate_limiter.throttle("send_message", self.cookie_id, f"{cid}:{toid}"):
+            await ws.send(json.dumps(msg))
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -16983,7 +16985,8 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
+            async with task_rate_limiter.throttle("send_message", self.cookie_id, f"{cid}:{toid}:image"):
+                await ws.send(json.dumps(msg))
             logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
 
         except Exception as e:

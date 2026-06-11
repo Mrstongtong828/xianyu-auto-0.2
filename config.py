@@ -1,4 +1,5 @@
 import os
+import json
 import yaml
 from typing import Dict, Any
 
@@ -30,6 +31,21 @@ class Config:
 
         with open(config_path, 'r', encoding='utf-8') as f:
             self._config = yaml.safe_load(f)
+        self._load_runtime_overrides()
+
+    def _load_runtime_overrides(self):
+        """加载运行期覆盖配置，兼容 Docker 只读应用目录。"""
+        override_path = os.path.join(os.path.dirname(__file__), 'data', 'task_rate_limiter_config.json')
+        if not os.path.exists(override_path):
+            return
+
+        try:
+            with open(override_path, 'r', encoding='utf-8') as f:
+                task_rate_limiter_config = json.load(f)
+            if isinstance(task_rate_limiter_config, dict):
+                self._config['TASK_RATE_LIMITER'] = task_rate_limiter_config
+        except Exception:
+            pass
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取配置项
